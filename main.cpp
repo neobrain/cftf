@@ -23,6 +23,92 @@ class ASTVisitor : public clang::RecursiveASTVisitor<ASTVisitor> {
 public:
     ASTVisitor(clang::Rewriter& rewriter_) : rewriter(rewriter_) {}
 
+    bool VisitCXXFoldExpr(clang::CXXFoldExpr* expr) {
+        std::cerr << "Visiting CXX fold expression" << std::endl;
+        std::cerr << "  " << std::flush;
+        auto* pattern = expr->getPattern();
+        pattern->dumpColor();
+        std::cerr << std::endl;
+        auto& sm = rewriter.getSourceMgr();
+        const auto pattern_base_str = GetClosedStringFor(pattern->getLocStart(), pattern->getLocEnd());
+
+        // TODO: Support operators: + - * / % ^ & | << >>, all of these with an = at the end; ==, !=, <, >, <=, >=, &&, ||, ",", .*, ->*
+        using namespace std::literals::string_view_literals;
+        std::map<clang::BinaryOperatorKind, std::string_view> operators;
+        operators[clang::BO_Add] = "add"sv;
+        operators[clang::BO_Sub] = "sub"sv;
+        operators[clang::BO_Mul] = "mul"sv;
+        operators[clang::BO_Div] = "div"sv;
+        operators[clang::BO_Rem] = "mod"sv;
+        operators[clang::BO_Xor] = "xor"sv;
+        operators[clang::BO_And] = "and"sv;
+        operators[clang::BO_Or]  = "or"sv;
+        operators[clang::BO_Shl] = "shl"sv;
+        operators[clang::BO_Shr] = "shr"sv;
+
+        operators[clang::BO_AddAssign] = "add_assign"sv;
+        operators[clang::BO_SubAssign] = "sub_assign"sv;
+        operators[clang::BO_MulAssign] = "mul_assign"sv;
+        operators[clang::BO_DivAssign] = "div_assign"sv;
+        operators[clang::BO_RemAssign] = "mod_assign"sv;
+        operators[clang::BO_XorAssign] = "xor_assign"sv;
+        operators[clang::BO_AndAssign] = "and_assign"sv;
+        operators[clang::BO_OrAssign] = "or_assign"sv;
+        operators[clang::BO_ShlAssign] = "shl_assign"sv;
+        operators[clang::BO_ShrAssign] = "shr_assign"sv;
+
+        operators[clang::BO_Assign] = "assign"sv;
+        operators[clang::BO_EQ] = "equals"sv;
+        operators[clang::BO_NE] = "notequals"sv;
+        operators[clang::BO_LT] = "less"sv;
+        operators[clang::BO_GT] = "greater"sv;
+        operators[clang::BO_LE] = "lessequals"sv;
+        operators[clang::BO_GE] = "greaterequals"sv;
+        operators[clang::BO_LAnd] = "land"sv;
+        operators[clang::BO_LOr] = "lor"sv;
+        operators[clang::BO_Comma] = "comma"sv;
+
+        auto fold_op = expr->getOperator();
+        if (fold_op == clang::BO_PtrMemD || fold_op == clang::BO_PtrMemI) {
+            // TODO: These might just work, actually...
+            throw std::runtime_error("Fold expressions on member access operators not supported, yet!");
+        }
+
+        auto init_value_str = expr->getInit() ? GetClosedStringFor(expr->getInit()->getLocStart(), expr->getInit()->getLocEnd()) : "";
+
+        // TODO: What value category should we use for the arguments?
+        //       Currently, assigment operators take lvalue-refs, and anything else copies by value
+        auto pattern_str = std::string("fold_expr_").append(operators.at(fold_op));
+        if (expr->isLeftFold()) {
+            pattern_str += "_left(";
+            if (expr->getInit()) {
+                pattern_str += init_value_str + ", ";
+            }
+        } else {
+            pattern_str += "_right(";
+        }
+        pattern_str += pattern_base_str + "...";
+        if (expr->isRightFold() && expr->getInit()) {
+            pattern_str += ", " + init_value_str;
+        }
+        pattern_str += ")";
+
+        std::cerr << "  Pattern: \"" << pattern_str << '"' << std::endl;
+        rewriter.ReplaceText(expr->getLocStart(), sm.getCharacterData(getLocForEndOfToken(expr->getLocEnd())) - sm.getCharacterData(expr->getLocStart()), pattern_str); 
+        return true;
+    }
+
+    bool TraverseCXXFoldExpr(clang::CXXFoldExpr* expr) {
+        // We currently can't perform any nested replacements within a fold expressions
+        // hence, visit this node but none of its children, and instead process those in the next pass
+
+        std::cerr << "Traversing fold expression: " << GetClosedStringFor(expr->getLocStart(), expr->getLocEnd()) << std::endl;
+
+        Parent::WalkUpFromCXXFoldExpr(expr);
+
+        return true;
+    }
+
     bool VisitStaticAssertDecl(clang::StaticAssertDecl* decl) {
         if (decl->getMessage() == nullptr) {
             // Add empty assertion message
@@ -36,6 +122,14 @@ public:
         }
 
         return true;
+    }
+
+    bool shouldTraversePostOrder() const {
+        // ACTUALLY, visit top-nodes first; that way, we can withhold further transformations in its child nodes if necessary
+        return false;
+
+        // Visit leaf-nodes first (so we transform the innermost expressions first)
+        //return true;
     }
 
 private:
