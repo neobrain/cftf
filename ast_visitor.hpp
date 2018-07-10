@@ -31,6 +31,9 @@ private:
 
     clang::ASTContext& context;
     std::unique_ptr<RewriterBase> rewriter;
+
+    bool in_fully_specialized_function = false;
+    clang::FunctionDecl* current_function = nullptr;
 };
 
 } // namespace cftf
