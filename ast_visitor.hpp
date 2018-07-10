@@ -6,6 +6,13 @@
 
 namespace cftf {
 
+// TODO: This should be moved elsewhere
+namespace features {
+
+inline bool constexpr_if = true;
+
+}
+
 class RewriterBase;
 
 class ASTVisitor : public clang::RecursiveASTVisitor<ASTVisitor> {
@@ -25,6 +32,8 @@ public:
 
     // Used to explicitly specialize function templates which might otherwise be specialized implicitly
     bool VisitFunctionTemplateDecl(clang::FunctionTemplateDecl* decl);
+
+    bool VisitIfStmt(clang::IfStmt* stmt);
 
     bool VisitStaticAssertDecl(clang::StaticAssertDecl* decl);
 

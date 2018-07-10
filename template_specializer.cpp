@@ -147,8 +147,16 @@ public:
         return needs_specialization;
     }
 
+    bool VisitIfStmt(clang::IfStmt* stmt) {
+        if (features::constexpr_if && stmt->isConstexpr()) {
+            needs_specialization = true;
+            // Abort traversal for this check
+            return false;
+        }
 
-    // NOTE: We never unset this currently. This will change once rewriting rules are added that can only operate on specializations.
+        return true;
+    }
+
     bool needs_specialization = false;
 };
 
