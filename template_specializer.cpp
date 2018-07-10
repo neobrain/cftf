@@ -178,6 +178,11 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
         // what's usually an implicit template specialization. We need to do
         // this for some rewriting rules to be effective, since some things
         // cannot generally be rewritten in a dependent context.
+        // TODO: Instead of ignoring this, we should traverse it and gather
+        //       a list of things that are "awkward" to rewrite, e.g.
+        //       parameter pack expansions. Having this list available later
+        //       when creating the explicit specializations will hopefully
+        //       be useful.
         return true;
     }
 
