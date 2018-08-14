@@ -207,23 +207,31 @@ private:
 
 } // namespace cftf
 
-int main(int argc, const char* argv[]){
-    using namespace std::string_literals;
 
-    // TODO: Write cftf output to this file!
-    const char temp_output_filename[] = "cftf_temp";
+
+struct ParsedCommandLine {
+    // Indexes into argv, referring to detected input filenames
+    std::vector<size_t> input_filename_arg_indices;
+
+    // Indexes into argv, referring to command line arguments that need to be forwarded to the internal libtooling pass
+    std::vector<size_t> input_indexes;
+};
+
+
+ParsedCommandLine ParseCommandLine(size_t argc, const char* argv[]) {
+    using namespace std::string_literals;
 
     // TODO: Strip CFTF-specific options from argument list
     // TODO: Add options specific to the CFTF pass to argument list
 
-    // Indexes into argv, referring to detected input filenames
+    // Indexes into argv, referring to detected input filenames (including the executable name)
     std::vector<size_t> input_filename_arg_indices;
 
     // Indexes into known command line arguments
     std::vector<size_t> input_indexes;
 
     input_filename_arg_indices.push_back(0); // executable name
-    for (size_t arg_idx = 1; arg_idx < static_cast<size_t>(argc); ++arg_idx) {
+    for (size_t arg_idx = 1; arg_idx < argc; ++arg_idx) {
         auto arg = argv[arg_idx];
 
         auto is_cpp_file = [](const char* str) -> bool {
@@ -244,7 +252,7 @@ int main(int argc, const char* argv[]){
                 // Preprocessor define
                 input_indexes.push_back(arg_idx);
                 if (arg[2] == ' ') {
-                    if (arg_idx + 1 == static_cast<size_t>(argc)) {
+                    if (arg_idx + 1 == argc) {
                         std::cerr << "Invalid input: Expected symbol after \"-D\", got end of command line" << std::endl;
                         std::exit(1);
                     }
@@ -261,27 +269,44 @@ int main(int argc, const char* argv[]){
         }
     }
 
-    // Restricted command line that only includes all input files
-    std::string internal_command_line =
-        std::accumulate(input_indexes.begin(), input_indexes.end(), ""s,
-            [argv](const std::string& prev, size_t next_idx) {
-                return prev + " " + argv[next_idx];
-            }
-        );
-    std::vector<const char*> internal_argv;
+    return { std::move(input_filename_arg_indices), std::move(input_indexes) };
+}
+
+struct InternalCommandLine {
+    std::vector<const char*> args;
+    std::string internal_storage;
+};
+
+InternalCommandLine BuildInternalCommandLine(const ParsedCommandLine& parse_cmdline, const char* argv[]) {
+    using namespace std::string_literals;
+
+    auto&& [ input_filename_arg_indices, input_indexes ] = parse_cmdline;
+
+    // Build a restricted command line that only includes all input files
+    InternalCommandLine internal_command_line;
+    std::vector<const char*>& internal_argv = internal_command_line.args;
     std::transform(input_filename_arg_indices.begin(), input_filename_arg_indices.end(), std::back_inserter(internal_argv), [argv](size_t idx) { return argv[idx]; });
     // TODO: Escape "'" within arguments
-    std::string extra_arg = std::accumulate(input_indexes.begin(), input_indexes.end(), "-extra-arg='"s,
-                                            [&argv](std::string& cur, size_t next_idx) { return cur + " " + argv[next_idx]; });
-    extra_arg += '\'';
-    internal_argv.push_back(extra_arg.c_str());
-    int internal_argc = internal_argv.size();
+    internal_command_line.internal_storage = std::accumulate(input_indexes.begin(), input_indexes.end(), "-extra-arg='"s,
+                                                             [&argv](std::string& cur, size_t next_idx) { return cur + " " + argv[next_idx]; });
+    internal_command_line.internal_storage += '\'';
+    internal_argv.push_back(internal_command_line.internal_storage.c_str());
+
+    return internal_command_line;
+}
+
+int main(int argc, const char* argv[]){
+    const char temp_output_filename[] = "cftf_temp";
+
+    auto parsed_cmdline = ParseCommandLine(static_cast<size_t>(argc), argv);
+    auto internal_argv = BuildInternalCommandLine(parsed_cmdline, argv);
 
     std::cerr << "Internal command line: \"";
-    std::copy(internal_argv.begin(), internal_argv.end(), std::ostream_iterator<const char*>(std::cerr, " "));
+    std::copy(internal_argv.args.begin(), internal_argv.args.end(), std::ostream_iterator<const char*>(std::cerr, " "));
     std::cerr << "\"" << std::endl;
 
-    auto options_parser = ct::CommonOptionsParser::create(internal_argc, internal_argv.data(), cftf::tool_category, llvm::cl::ZeroOrMore);
+    int internal_argc = internal_argv.args.size();
+    auto options_parser = ct::CommonOptionsParser::create(internal_argc, internal_argv.args.data(), cftf::tool_category, llvm::cl::ZeroOrMore);
     if (!options_parser) {
         llvm::handleErrors(options_parser.takeError(), [](const llvm::ErrorInfoBase& err_info) { llvm::errs() << err_info.message() << '\n'; });
         std::exit(1);
@@ -306,9 +331,10 @@ int main(int argc, const char* argv[]){
     // Replace original input filenames with temp_output_filename
     std::string modified_cmdline = frontend_command;
     for (size_t arg_idx = 0; arg_idx < static_cast<size_t>(argc); ++arg_idx) {
+        using namespace std::literals::string_literals;
         auto arg = argv[arg_idx];
 
-        if (arg_idx != 0 && input_filename_arg_indices.end() != std::find(input_filename_arg_indices.begin(), input_filename_arg_indices.end(), arg_idx)) {
+        if (arg_idx != 0 && parsed_cmdline.input_filename_arg_indices.end() != std::find(parsed_cmdline.input_filename_arg_indices.begin(), parsed_cmdline.input_filename_arg_indices.end(), arg_idx)) {
             // Positional argument; this is an input file, probably
             std::cerr << "Replacing presumable input argument \"" << arg << "\" with \"" << temp_output_filename << "\"" << std::endl;
             // TODO: Wrap filename in quotes!
