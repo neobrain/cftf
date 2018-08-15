@@ -230,7 +230,6 @@ ParsedCommandLine ParseCommandLine(size_t argc, const char* argv[]) {
     // Indexes into known command line arguments
     std::vector<size_t> input_indexes;
 
-    input_filename_arg_indices.push_back(0); // executable name
     for (size_t arg_idx = 1; arg_idx < argc; ++arg_idx) {
         auto arg = argv[arg_idx];
 
@@ -285,42 +284,98 @@ InternalCommandLine BuildInternalCommandLine(const ParsedCommandLine& parse_cmdl
     // Build a restricted command line that only includes all input files
     InternalCommandLine internal_command_line;
     std::vector<const char*>& internal_argv = internal_command_line.args;
-    std::transform(input_filename_arg_indices.begin(), input_filename_arg_indices.end(), std::back_inserter(internal_argv), [argv](size_t idx) { return argv[idx]; });
-    // TODO: Escape "'" within arguments
-    internal_command_line.internal_storage = std::accumulate(input_indexes.begin(), input_indexes.end(), "-extra-arg='"s,
-                                                             [&argv](std::string& cur, size_t next_idx) { return cur + " " + argv[next_idx]; });
-    internal_command_line.internal_storage += '\'';
-    internal_argv.push_back(internal_command_line.internal_storage.c_str());
 
+    internal_command_line.internal_storage.reserve(1000); // TODO: HACK!!
+    std::transform(input_indexes.begin(), input_indexes.end(), std::back_inserter(internal_argv),
+                    [&argv, &storage=internal_command_line.internal_storage](size_t idx) {
+                        const char* ptr = &*storage.end();
+                        storage += argv[idx];
+                        storage += '\0';
+                        return ptr;
+                    });
+    std::transform(input_filename_arg_indices.begin(), input_filename_arg_indices.end(), std::back_inserter(internal_argv), [argv](size_t idx) { return argv[idx]; });
     return internal_command_line;
 }
 
-int main(int argc, const char* argv[]){
-    const char temp_output_filename[] = "cftf_temp";
+class CompilationDatabase : public ct::CompilationDatabase {
+    std::vector<std::string> infiles;
+    std::vector<ct::CompileCommand> commands;
 
+public:
+    CompilationDatabase(const ParsedCommandLine& parsed_cmdline, const InternalCommandLine& internal_cmdline, const char* argv[]) {
+        // TODO: Support multiple input files
+        assert(parsed_cmdline.input_filename_arg_indices.size() == 1);
+
+        std::transform(parsed_cmdline.input_filename_arg_indices.begin(), parsed_cmdline.input_filename_arg_indices.end(), std::back_inserter(infiles),
+                    [argv](size_t index) {
+                        return argv[index];
+                    });
+
+        ct::CompileCommand cmd;
+        cmd.Directory = "."; // Current working directory
+        cmd.Filename = argv[parsed_cmdline.input_filename_arg_indices[0]];
+
+        // The first argument is always skipped over, since it's just the executable name. We add it here so libtooling doesn't skip over data that's actually important
+        cmd.CommandLine.push_back("cftf");
+        std::copy(internal_cmdline.args.begin(), internal_cmdline.args.end(), std::back_inserter(cmd.CommandLine));
+
+        if (cmd.Filename == "-") {
+            std::cerr << "stdin not supported, yet" << std::endl;
+            std::exit(1);
+        } else {
+            // Insert "_cftf_out" before the file extension (or at the end of the filename if there is no file extension)
+            // TODO: The output should be written to a temporary folder instead
+            auto period_pos = cmd.Filename.find_last_of('.');
+            if (period_pos == std::string::npos) {
+                period_pos = cmd.Filename.length();
+            }
+            std::copy(cmd.Filename.begin(), cmd.Filename.begin() + period_pos, std::back_inserter(cmd.Output));
+            cmd.Output += "_cftf_out";
+            std::copy(cmd.Filename.begin() + period_pos, cmd.Filename.end(), std::back_inserter(cmd.Output));
+        }
+
+        commands.emplace_back(cmd);
+    }
+
+    std::vector<ct::CompileCommand> getCompileCommands(llvm::StringRef) const override {
+        // TODO: Take the given path into consideration
+        return commands;
+    }
+
+    std::vector<std::string> getAllFiles() const override {
+        return infiles;
+    }
+};
+
+
+int main(int argc, const char* argv[]){
     auto parsed_cmdline = ParseCommandLine(static_cast<size_t>(argc), argv);
     auto internal_argv = BuildInternalCommandLine(parsed_cmdline, argv);
 
-    std::cerr << "Internal command line: \"";
-    std::copy(internal_argv.args.begin(), internal_argv.args.end(), std::ostream_iterator<const char*>(std::cerr, " "));
-    std::cerr << "\"" << std::endl;
+    CompilationDatabase compilation_database(parsed_cmdline, internal_argv, argv);
 
-    int internal_argc = internal_argv.args.size();
-    auto options_parser = ct::CommonOptionsParser::create(internal_argc, internal_argv.args.data(), cftf::tool_category, llvm::cl::ZeroOrMore);
-    if (!options_parser) {
-        llvm::handleErrors(options_parser.takeError(), [](const llvm::ErrorInfoBase& err_info) { llvm::errs() << err_info.message() << '\n'; });
-        std::exit(1);
+    // Run FrontendAction on each input file
+    for (auto& file : compilation_database.getAllFiles()) {
+        std::cerr << "Processing file " << file << std::endl;
+
+        for (auto& cmd : compilation_database.getCompileCommands(file)) {
+            std::cerr << "  Directory: " << cmd.Directory << std::endl;
+            std::cerr << "  Command:   ";
+            for (auto& cmd2 : cmd.CommandLine) {
+                std::cerr << cmd2 << " ";
+            }
+            std::cerr << std::endl;
+            std::cerr << "  Output:    " << cmd.Output << std::endl;
+        }
+        std::cerr << std::endl;
+
+        ct::ClangTool tool(compilation_database, file);
+        int result = tool.run(ct::newFrontendActionFactory<cftf::FrontendAction>().get());
+        if (result != 0) {
+            std::cerr << "CFTF FrontendAction failed on file \"" << file << "\" with code " << result << std::endl;
+            std::exit(1);
+        }
     }
-
-    if (options_parser->getSourcePathList().size() > 1) {
-        // TODO: Support multiple input files
-        std::cerr << "Processing multiple files is not supported, yet" << std::endl;
-        std::exit(1);
-    }
-
-    ct::ClangTool tool(options_parser->getCompilations(), options_parser->getSourcePathList());
-
-    int result = tool.run(ct::newFrontendActionFactory<cftf::FrontendAction>().get());
 
     const char* frontend_command = std::getenv("CFTF_FRONTEND_CXX");
     if (!frontend_command || frontend_command[0] == 0) {
@@ -328,14 +383,20 @@ int main(int argc, const char* argv[]){
         exit(1);
     }
 
-    // Replace original input filenames with temp_output_filename
+    // Replace original input filenames with the corresponding cftf output
     std::string modified_cmdline = frontend_command;
     for (size_t arg_idx = 0; arg_idx < static_cast<size_t>(argc); ++arg_idx) {
         using namespace std::literals::string_literals;
         auto arg = argv[arg_idx];
 
-        if (arg_idx != 0 && parsed_cmdline.input_filename_arg_indices.end() != std::find(parsed_cmdline.input_filename_arg_indices.begin(), parsed_cmdline.input_filename_arg_indices.end(), arg_idx)) {
-            // Positional argument; this is an input file, probably
+        if (parsed_cmdline.input_filename_arg_indices.end() != std::find(parsed_cmdline.input_filename_arg_indices.begin(), parsed_cmdline.input_filename_arg_indices.end(), arg_idx)) {
+            auto compile_commands = compilation_database.getCompileCommands(arg);
+            assert(!compile_commands.empty());
+            if (compile_commands.size() > 1) {
+                std::cerr << "Compiling the same file multiple times is not supported yet. Please raise a bug report if you run into this issue" << std::endl;
+                std::exit(1);
+            }
+            auto temp_output_filename = compile_commands[0].Output;
             std::cerr << "Replacing presumable input argument \"" << arg << "\" with \"" << temp_output_filename << "\"" << std::endl;
             // TODO: Wrap filename in quotes!
             modified_cmdline += " "s + temp_output_filename;
@@ -349,7 +410,5 @@ int main(int argc, const char* argv[]){
     // Trigger proper compilation
     std::cerr << "Invoking \"" << modified_cmdline << "\"" << std::endl;
     std::system(modified_cmdline.c_str());
-
-    return result;
 }
 
