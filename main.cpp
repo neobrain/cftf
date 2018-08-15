@@ -9,8 +9,10 @@
 #include <clang/Tooling/Tooling.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <llvm/Support/CommandLine.h>
-#include "llvm/Support/Error.h"
+#include <llvm/Support/Error.h>
+#include <llvm/Support/raw_os_ostream.h>
 
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <numeric>
@@ -184,6 +186,20 @@ private:
     std::unique_ptr<ASTVisitor> visitor;
 };
 
+static std::string GetOutputFilename(llvm::StringRef filename) {
+    // Insert "_cftf_out" before the file extension (or at the end of the filename if there is no file extension)
+    // TODO: The output should be written to a temporary folder instead
+    auto period_pos = filename.find_last_of('.');
+    if (period_pos == std::string::npos) {
+        period_pos = filename.size();
+    }
+    std::string output;
+    std::copy(filename.begin(), filename.begin() + period_pos, std::back_inserter(output));
+    output += "_cftf_out";
+    std::copy(filename.begin() + period_pos, filename.end(), std::back_inserter(output));
+    return output;
+}
+
 class FrontendAction : public clang::ASTFrontendAction {
 public:
     FrontendAction() {}
@@ -192,7 +208,12 @@ public:
         std::cerr << "Executing action" << std::endl;
 
         clang::SourceManager& sm = rewriter.getSourceMgr();
-        rewriter.getEditBuffer(sm.getMainFileID()).write(llvm::outs());
+        // TODO: Handle stdin
+        auto filename = GetOutputFilename(sm.getFileEntryForID(sm.getMainFileID())->getName().data());
+        std::cerr << "Writing FrontendAction output to \"" << filename << "\"" << std::endl;
+        std::ofstream output(filename);
+        llvm::raw_os_ostream llvm_output_stream(output);
+        rewriter.getEditBuffer(sm.getMainFileID()).write(llvm_output_stream);
     }
 
     std::unique_ptr<clang::ASTConsumer> CreateASTConsumer(clang::CompilerInstance& ci, clang::StringRef file) override {
@@ -323,15 +344,7 @@ public:
             std::cerr << "stdin not supported, yet" << std::endl;
             std::exit(1);
         } else {
-            // Insert "_cftf_out" before the file extension (or at the end of the filename if there is no file extension)
-            // TODO: The output should be written to a temporary folder instead
-            auto period_pos = cmd.Filename.find_last_of('.');
-            if (period_pos == std::string::npos) {
-                period_pos = cmd.Filename.length();
-            }
-            std::copy(cmd.Filename.begin(), cmd.Filename.begin() + period_pos, std::back_inserter(cmd.Output));
-            cmd.Output += "_cftf_out";
-            std::copy(cmd.Filename.begin() + period_pos, cmd.Filename.end(), std::back_inserter(cmd.Output));
+            cmd.Output = cftf::GetOutputFilename(cmd.Filename);
         }
 
         commands.emplace_back(cmd);
@@ -385,7 +398,7 @@ int main(int argc, const char* argv[]){
 
     // Replace original input filenames with the corresponding cftf output
     std::string modified_cmdline = frontend_command;
-    for (size_t arg_idx = 0; arg_idx < static_cast<size_t>(argc); ++arg_idx) {
+    for (size_t arg_idx = 1; arg_idx < static_cast<size_t>(argc); ++arg_idx) {
         using namespace std::literals::string_literals;
         auto arg = argv[arg_idx];
 
@@ -400,6 +413,13 @@ int main(int argc, const char* argv[]){
             std::cerr << "Replacing presumable input argument \"" << arg << "\" with \"" << temp_output_filename << "\"" << std::endl;
             // TODO: Wrap filename in quotes!
             modified_cmdline += " "s + temp_output_filename;
+
+            // TODO: If "-o" has not been supplied, explicitly add it here.
+            //       This is needed because the default filename chosen depends
+            //       on the input filename, but since we replace the original
+            //       input filename with our intermediate output file, the
+            //       final output will be named differently unless we
+            //       explicitly specifiy it
         } else {
             // Other argument; just copy this to the new command line
             // TODO: Wrap arguments in quotes or escape them!
