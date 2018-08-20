@@ -2,16 +2,14 @@
 #include "rewriter.hpp"
 
 #include <clang/Lex/Lexer.h>
-#include <clang/Tooling/CommonOptionsParser.h>
 #include <clang/Frontend/FrontendAction.h>
 #include <clang/Frontend/ASTConsumers.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Tooling/Tooling.h>
 #include <clang/Rewrite/Core/Rewriter.h>
-#include <llvm/Support/CommandLine.h>
-#include <llvm/Support/Error.h>
 #include <llvm/Support/raw_os_ostream.h>
 
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -186,19 +184,33 @@ private:
     std::unique_ptr<ASTVisitor> visitor;
 };
 
-static std::string GetOutputFilename(llvm::StringRef filename) {
-    // Insert "_cftf_out" before the file extension (or at the end of the filename if there is no file extension)
-    // TODO: The output should be written to a temporary folder instead
-    auto period_pos = filename.find_last_of('.');
-    if (period_pos == std::string::npos) {
-        period_pos = filename.size();
+static std::string GetOutputFilename(llvm::StringRef input_filename) {
+    auto slash_pos = input_filename.find_last_of('/');
+    if (slash_pos == std::string::npos) {
+        slash_pos = 0;
+    } else {
+        ++slash_pos;
     }
-    std::string output;
-    std::copy(filename.begin(), filename.begin() + period_pos, std::back_inserter(output));
+
+    // Insert "_cftf_out" before the file extension (or at the end of the filename if there is no file extension),
+    // and then add ".cpp"
+    auto period_pos = input_filename.find_last_of('.');
+    if (period_pos == std::string::npos) {
+        period_pos = input_filename.size();
+    }
+
+    period_pos = std::max(period_pos, slash_pos);
+
+    // TODO: Prefix the output filename with some unique token for the current compilation flags and working directory
+    std::string output = std::filesystem::temp_directory_path() / std::string(input_filename.begin() + slash_pos, input_filename.begin() + period_pos);
+
     output += "_cftf_out";
-    std::copy(filename.begin() + period_pos, filename.end(), std::back_inserter(output));
+    std::copy(input_filename.begin() + period_pos, input_filename.end(), std::back_inserter(output));
+    output += ".cpp";
     return output;
 }
+
+ct::CompilationDatabase* global_compilation_database = nullptr;
 
 class FrontendAction : public clang::ASTFrontendAction {
 public:
@@ -209,9 +221,11 @@ public:
 
         clang::SourceManager& sm = rewriter.getSourceMgr();
         // TODO: Handle stdin
-        auto filename = GetOutputFilename(sm.getFileEntryForID(sm.getMainFileID())->getName().data());
-        std::cerr << "Writing FrontendAction output to \"" << filename << "\"" << std::endl;
-        std::ofstream output(filename);
+        auto filename = sm.getFileEntryForID(sm.getMainFileID())->getName().data();
+        auto commands = global_compilation_database->getCompileCommands(filename);
+        assert(commands.size() == 1);
+        auto out_filename = GetOutputFilename(commands[0].Filename);
+        std::ofstream output(out_filename);
         llvm::raw_os_ostream llvm_output_stream(output);
         rewriter.getEditBuffer(sm.getMainFileID()).write(llvm_output_stream);
     }
@@ -236,6 +250,8 @@ struct ParsedCommandLine {
 
     // Indexes into argv, referring to command line arguments that need to be forwarded to the internal libtooling pass
     std::vector<size_t> input_indexes;
+
+    std::string frontend_compiler;
 };
 
 
@@ -251,15 +267,23 @@ ParsedCommandLine ParseCommandLine(size_t argc, const char* argv[]) {
     // Indexes into known command line arguments
     std::vector<size_t> input_indexes;
 
+    std::string frontend_compiler;
+
     for (size_t arg_idx = 1; arg_idx < argc; ++arg_idx) {
         auto arg = argv[arg_idx];
 
         auto is_cpp_file = [](const char* str) -> bool {
             // TODO: This is a very incomplete heuristic:
-            //       * Not everybody uses .cpp for C++ files
+            //       * Not everybody uses .cpp/.cxx for C++ files
             //       * The source language can be overridden by user flags
             auto len = std::strlen(str);
-            return (len > 3) && (0 == std::strcmp(str + len - 4, ".cpp"));
+            if ((len > 3) && (0 == std::strcmp(str + len - 4, ".cpp"))) {
+                return true;
+            }
+            if ((len > 3) && (0 == std::strcmp(str + len - 4, ".cxx"))) {
+                return true;
+            }
+            return false;
         };
 
         if (std::strcmp(arg, "-") == 0) {
@@ -268,10 +292,18 @@ ParsedCommandLine ParseCommandLine(size_t argc, const char* argv[]) {
             std::exit(1);
         } else if (arg[0] == '-') {
             // This argument is some sort of flag.
-            if (arg[1] == 'D') {
+            if (std::strcmp(arg, "-c") == 0) {
+                // Compile only (no linking)
+                input_indexes.push_back(arg_idx);
+            } else if (std::strcmp(arg, "-o") == 0) {
+                // Output filename
+                // Needed to generate a suitable filename for the generated, intermediate C++ code
+                input_indexes.push_back(arg_idx++);
+                input_indexes.push_back(arg_idx);
+            } else if (arg[1] == 'D' || arg[1] == 'I' || std::strcmp(arg, "-isystem") == 0) {
                 // Preprocessor define
                 input_indexes.push_back(arg_idx);
-                if (arg[2] == ' ') {
+                if (arg[2] == ' ' || std::strcmp(arg, "-isystem") == 0) {
                     if (arg_idx + 1 == argc) {
                         std::cerr << "Invalid input: Expected symbol after \"-D\", got end of command line" << std::endl;
                         std::exit(1);
@@ -280,16 +312,26 @@ ParsedCommandLine ParseCommandLine(size_t argc, const char* argv[]) {
                     // Note that if a value is provided, it's provided via "=VALUE", i.e. it cannot be space-separated.
                     input_indexes.push_back(++arg_idx);
                 }
+            } else if (arg[1] == 's' || arg[2] == 't' || arg[3] == 'd' || arg[4] == '=') {
+                // Set C++ language standard version
+                input_indexes.push_back(arg_idx);
+            } else if (std::strncmp(arg, "-frontend-compiler=", std::strlen("-frontend-compiler=")) == 0) {
+                // CTFT-internal option
+                frontend_compiler = arg + strlen("-frontend-compiler=");
+            } else if (false) {
+                // TODO: -i, -isystem, -iquote, -idirafter
+                // TODO: -stdlib?
             } else {
                 std::cerr << "Ignoring command line option \"" << arg << "\"" << std::endl;
             }
         } else if (is_cpp_file(arg)) {
             // TODO: Does this catch all inputs? Is there a way to specify inputs via non-positional command line arguments?
+            std::cerr << "Detected input cpp file \"" << arg << "\"" << std::endl;
             input_filename_arg_indices.push_back(arg_idx);
         }
     }
 
-    return { std::move(input_filename_arg_indices), std::move(input_indexes) };
+    return { std::move(input_filename_arg_indices), std::move(input_indexes), std::move(frontend_compiler) };
 }
 
 struct InternalCommandLine {
@@ -297,10 +339,10 @@ struct InternalCommandLine {
     std::string internal_storage;
 };
 
-InternalCommandLine BuildInternalCommandLine(const ParsedCommandLine& parse_cmdline, const char* argv[]) {
+InternalCommandLine BuildInternalCommandLine(const ParsedCommandLine& parsed_cmdline, const char* argv[]) {
     using namespace std::string_literals;
 
-    auto&& [ input_filename_arg_indices, input_indexes ] = parse_cmdline;
+    auto&& [ input_filename_arg_indices, input_indexes, ignored ] = parsed_cmdline;
 
     // Build a restricted command line that only includes all input files
     InternalCommandLine internal_command_line;
@@ -324,30 +366,39 @@ class CompilationDatabase : public ct::CompilationDatabase {
 
 public:
     CompilationDatabase(const ParsedCommandLine& parsed_cmdline, const InternalCommandLine& internal_cmdline, const char* argv[]) {
-        // TODO: Support multiple input files
-        assert(parsed_cmdline.input_filename_arg_indices.size() == 1);
+        assert(parsed_cmdline.input_filename_arg_indices.size() <= 1);
 
-        std::transform(parsed_cmdline.input_filename_arg_indices.begin(), parsed_cmdline.input_filename_arg_indices.end(), std::back_inserter(infiles),
-                    [argv](size_t index) {
-                        return argv[index];
-                    });
+        if (!parsed_cmdline.input_filename_arg_indices.empty()) {
+            std::transform(parsed_cmdline.input_filename_arg_indices.begin(), parsed_cmdline.input_filename_arg_indices.end(), std::back_inserter(infiles),
+                        [argv](size_t index) {
+                            return argv[index];
+                        });
 
-        ct::CompileCommand cmd;
-        cmd.Directory = "."; // Current working directory
-        cmd.Filename = argv[parsed_cmdline.input_filename_arg_indices[0]];
+            ct::CompileCommand cmd;
+            cmd.Directory = "."; // Current working directory
+            cmd.Filename = argv[parsed_cmdline.input_filename_arg_indices[0]];
 
-        // The first argument is always skipped over, since it's just the executable name. We add it here so libtooling doesn't skip over data that's actually important
-        cmd.CommandLine.push_back("cftf");
-        std::copy(internal_cmdline.args.begin(), internal_cmdline.args.end(), std::back_inserter(cmd.CommandLine));
+            // The first argument is always skipped over, since it's just the executable name. We add it here so libtooling doesn't skip over data that's actually important
+            cmd.CommandLine.push_back("cftf");
+            std::copy(internal_cmdline.args.begin(), internal_cmdline.args.end(), std::back_inserter(cmd.CommandLine));
 
-        if (cmd.Filename == "-") {
-            std::cerr << "stdin not supported, yet" << std::endl;
-            std::exit(1);
-        } else {
-            cmd.Output = cftf::GetOutputFilename(cmd.Filename);
+            // Override the resource-directory, which defaults to a path
+            // relative to the current working directory. This is used to
+            // locate standard library headers though, so we really want to
+            // use the resource directory of the actual toolchain instead
+            // TODO: Specify this more generically
+            // TODO: Only specify this when not already provided by the user
+            cmd.CommandLine.push_back("-resource-dir=/usr/lib64/clang/6.0.1");
+
+            if (cmd.Filename == "-") {
+                std::cerr << "stdin not supported, yet" << std::endl;
+                std::exit(1);
+            } else {
+                cmd.Output = cftf::GetOutputFilename(cmd.Filename);
+            }
+
+            commands.emplace_back(cmd);
         }
-
-        commands.emplace_back(cmd);
     }
 
     std::vector<ct::CompileCommand> getCompileCommands(llvm::StringRef) const override {
@@ -366,6 +417,7 @@ int main(int argc, const char* argv[]){
     auto internal_argv = BuildInternalCommandLine(parsed_cmdline, argv);
 
     CompilationDatabase compilation_database(parsed_cmdline, internal_argv, argv);
+    cftf::global_compilation_database = &compilation_database;
 
     // Run FrontendAction on each input file
     for (auto& file : compilation_database.getAllFiles()) {
@@ -383,6 +435,7 @@ int main(int argc, const char* argv[]){
         std::cerr << std::endl;
 
         ct::ClangTool tool(compilation_database, file);
+        // TODO: Use a custom DiagnosticsConsumer to silence the redundant warning output
         int result = tool.run(ct::newFrontendActionFactory<cftf::FrontendAction>().get());
         if (result != 0) {
             std::cerr << "CFTF FrontendAction failed on file \"" << file << "\" with code " << result << std::endl;
@@ -390,9 +443,9 @@ int main(int argc, const char* argv[]){
         }
     }
 
-    const char* frontend_command = std::getenv("CFTF_FRONTEND_CXX");
+    const char* frontend_command = !parsed_cmdline.frontend_compiler.empty() ? parsed_cmdline.frontend_compiler.c_str() : std::getenv("CFTF_FRONTEND_CXX");
     if (!frontend_command || frontend_command[0] == 0) {
-        std::cerr << "Error: CFTF_FRONTEND_CXX not set" << std::endl;
+        std::cerr << "Error: -frontend-compiler not set, nor was CFTF_FRONTEND_CXX set" << std::endl;
         exit(1);
     }
 
@@ -420,11 +473,24 @@ int main(int argc, const char* argv[]){
             //       input filename with our intermediate output file, the
             //       final output will be named differently unless we
             //       explicitly specifiy it
+        } else if (std::strncmp(arg, "-frontend-compiler=", std::strlen("-frontend-compiler=")) == 0) {
+            // CFTF-specific argument => silently drop it from the command line
+        } else if (/* DISABLES CODE */ (false) && std::strncmp(arg, "-std=", std::strlen("-std=")) == 0) {
+            // TODO: Should downgrade the C++ version requirements from gnu++17/c++17 to 14 or 11
         } else {
             // Other argument; just copy this to the new command line
             // TODO: Wrap arguments in quotes or escape them!
             modified_cmdline += " "s + arg;
         }
+    }
+
+    // Add file path to the include directories to make ""-includes work
+    // TODO: Instead of doing this, we could just rewrite #include statements for absolute file paths
+    if (!parsed_cmdline.input_filename_arg_indices.empty()) {
+        // TODO: This needs to be done for every input file, so it won't work when compiling multiple source files stored in different folders...
+        assert(parsed_cmdline.input_filename_arg_indices.size() == 1);
+        auto path = std::filesystem::absolute(argv[parsed_cmdline.input_filename_arg_indices[0]]).parent_path();
+        modified_cmdline += " -I\"" + path.string() + "\"";
     }
 
     // Trigger proper compilation

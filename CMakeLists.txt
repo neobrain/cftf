@@ -6,6 +6,6 @@ find_package(Clang REQUIRED CONFIG HINTS /usr/lib64/cmake/clang)
 find_package(LLVM REQUIRED CONFIG HINTS /usr/lib64/cmake/llvm)
 
 add_executable(cftf constexpr_if.cpp main.cpp rewriter.cpp template_specializer.cpp)
-target_link_libraries(cftf LLVM clangAST clangBasic clangFrontend clangLex clangTooling clangRewrite)
+target_link_libraries(cftf LLVM clangAST clangBasic clangFrontend clangLex clangTooling clangRewrite stdc++fs)
 set_property(TARGET cftf PROPERTY CXX_STANDARD 17)
 set_property(TARGET cftf PROPERTY CXX_STANDARD_REQUIRED ON)
