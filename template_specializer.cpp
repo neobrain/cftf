@@ -177,7 +177,9 @@ clang::ParmVarDecl* ASTVisitor::CurrentFunctionInfo::FindTemplatedParamDecl(clan
                                                       });
                                return (it != param.specialized.end());
                            });
-    assert (it != parameters.end());
+    if (it == parameters.end()) {
+        return nullptr;
+    }
 
     return it->templated;
 }
@@ -288,46 +290,50 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
                        });
 
 
-        if (decl->getPrimaryTemplate()->getTemplatedDecl()->param_size()) {
+        // Replace template parameters in the specialized signature with the actual template parameters
+        if (templated_function_decl->param_size()) {
             std::string addendum;
 
-            clang::SourceLocation parameters_loc_start = decl->getPrimaryTemplate()->getTemplatedDecl()->parameters().front()->getLocStart();
-            clang::SourceLocation parameters_loc_end = decl->getPrimaryTemplate()->getTemplatedDecl()->parameters().back()->getLocEnd();
-            bool first = true;
-            clang::ParmVarDecl* last_templated_parameter = nullptr; // Parameter in the templated function declaration, corresponding to the current specialized parameter
-            size_t templated_parameter_pack_counter = 0; // Counter used to assign distinguished names for parameters generated from a single parameter pack
-            for (auto* parameter : decl->parameters()) {
-                if (!first) {
-                    addendum += ", ";
-                } else {
-                    first = false;
+            clang::SourceLocation parameters_loc_start = templated_function_decl->parameters().front()->getLocStart();
+            clang::SourceLocation parameters_loc_end = templated_function_decl->parameters().back()->getLocEnd();
+            bool first_printed_parameter = true;
+
+            for (auto parameter_it = decl->param_begin(); parameter_it != decl->param_end();) {
+                // Check if we are in a block of parameters generated from a parameter pack,
+                // and if we are process the entire block at once
+                size_t parameters_in_current_pack = 1;
+                auto templated_parameter = current_function.FindTemplatedParamDecl(*parameter_it);
+                if (templated_parameter && templated_parameter->isParameterPack()) {
+                    // TODO: Change API to return the Parameter directly so we don't need to do this utterly irrelevant lookup
+                    auto generated_parameters = current_function.FindSpecializedParamDecls(templated_parameter);
+                    parameters_in_current_pack = generated_parameters.size();
                 }
-                // TODO: For on-the-fly declared template arguments like e.g. in "func<struct unnamed>()", getAsString will print spam such as "struct(anonymous namespace)::unnamed". We neither want that namespace nor do we want the "struct" prefix!
-                // NOTE: CppInsights has a lot more code to handle getting the parameter name and type...
-                addendum += parameter->getType().getAsString();
-                if (!parameter->getNameAsString().empty()) {
-                    addendum += " ";
-                    addendum += parameter->getNameAsString();
+                const auto parameter_pack_begin_it = parameter_it;
+                const auto parameter_pack_end_it   = parameter_it + parameters_in_current_pack;
 
-                    // Parameter generated from a parameter pack will be assigned the same name,
-                    // so we need to distinguish the generated parameter names manually.
+                for (; parameter_it != parameter_pack_end_it; ++parameter_it) {
+                    assert(parameter_it != decl->param_end());
+                    auto* parameter = *parameter_it;
 
-                    // To check if this parameter is part of an expanded parameter pack, find the
-                    // corresponding parameter in the primary function template.
-                    auto current_templated_parameter = current_function.FindTemplatedParamDecl(parameter);
-                    if (current_templated_parameter->isParameterPack()) {
-                        if (current_templated_parameter == last_templated_parameter) {
-                            ++templated_parameter_pack_counter;
-                        } else {
-                            last_templated_parameter = current_templated_parameter;
-                            templated_parameter_pack_counter = 1;
-                        }
-
-                        // TODO: This will break if there is already a parameter with the new name
-                        addendum += std::to_string(templated_parameter_pack_counter);
+                    if (!first_printed_parameter) {
+                        addendum += ", ";
                     } else {
-                        last_templated_parameter = nullptr;
-                        templated_parameter_pack_counter = 0;
+                        first_printed_parameter = false;
+                    }
+                    // TODO: For on-the-fly declared template arguments like e.g. in "func<struct unnamed>()", getAsString will print spam such as "struct(anonymous namespace)::unnamed". We neither want that namespace nor do we want the "struct" prefix!
+                    // NOTE: CppInsights has a lot more code to handle getting the parameter name and type...
+                    addendum += parameter->getType().getAsString();
+                    if (!parameter->getNameAsString().empty()) {
+                        addendum += " ";
+                        addendum += parameter->getNameAsString();
+
+                        // Parameter generated from a parameter pack will be assigned the same name,
+                        // so we need to distinguish the generated parameter names manually.
+
+                        if (templated_parameter->isParameterPack()) {
+                            // TODO: This will break if there is already a parameter with the new name
+                            addendum += std::to_string(1 + std::distance(parameter_pack_begin_it, parameter_it));
+                        }
                     }
                 }
             }
