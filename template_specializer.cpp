@@ -168,6 +168,36 @@ bool ASTVisitor::VisitFunctionDecl(clang::FunctionDecl*) {
     return true;
 }
 
+clang::ParmVarDecl* ASTVisitor::CurrentFunctionInfo::FindTemplatedParamDecl(clang::ParmVarDecl* specialized) const {
+    auto it = std::find_if(parameters.begin(), parameters.end(),
+                           [specialized](const Parameter& param) {
+                               auto it = std::find_if(param.specialized.begin(), param.specialized.end(),
+                                                      [=](clang::ParmVarDecl* decl) {
+                                                          return (decl == specialized);
+                                                      });
+                               return (it != param.specialized.end());
+                           });
+    assert (it != parameters.end());
+
+    return it->templated;
+}
+
+const std::vector<clang::ParmVarDecl*>& ASTVisitor::CurrentFunctionInfo::FindSpecializedParamDecls(clang::ParmVarDecl* templated) const {
+    auto it = std::find_if(parameters.begin(), parameters.end(),
+                           [templated](const Parameter& param) {
+                               return (param.templated == templated);
+                           });
+    assert (it != parameters.end());
+
+    return it->specialized;
+}
+
+// TODO: Move elsewhere
+bool ASTVisitor::VisitSizeOfPackExpr(clang::SizeOfPackExpr* expr) {
+    rewriter->ReplaceTextIncludingEndToken({ expr->getLocStart(), expr->getLocEnd() }, std::to_string(expr->getPackLength()));
+    return true;
+}
+
 bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
     decltype(rewriter) old_rewriter;
 
@@ -191,6 +221,8 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
         // Don't specialize functions from system headers
         specialize = false;
     }
+
+    CurrentFunctionInfo current_function = { decl, {} };
     if (specialize) {
         // Temporarily exchange our clang::Rewriter with an internal rewriter that writes to a copy of the current function (which will act as an explicit instantiation)
         // TODO: This will fail sooner or later; functions can be nested e.g. by declaring a class inside a function!
@@ -199,22 +231,30 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
 
         // Add template argument list for this specialization
         {
-            std::string addendum = "<";
+            std::string addendum;
+            llvm::raw_string_ostream ss(addendum);
+            ss << '<';
             assert(decl->getTemplateSpecializationArgs());
             auto&& template_args = decl->getTemplateSpecializationArgs()->asArray();
             for (auto it = template_args.begin(); it != template_args.end(); ++it) {
                 if (it != template_args.begin()) {
-                    addendum += ", ";
+                    ss << ", ";
                 }
-                std::string str;
-                llvm::raw_string_ostream ss(str);
                 clang::LangOptions policy; // TODO: Get this from the proper source!
-                // TODO: *it might be a parameter pack, which is printed with "<>" on the outside!
-                it->print(policy, ss);
-                ss.flush();
-                addendum += ss.str();
+                if (it->getKind() == clang::TemplateArgument::Pack) {
+                    // Print each item in the parameter pack individually
+                    for (auto pack_it = it->pack_begin(); pack_it < it->pack_end(); ++pack_it) {
+                        if (pack_it != it->pack_begin()) {
+                            ss << ", ";
+                        }
+                        pack_it->print(policy, ss);
+                    }
+                } else {
+                    it->print(policy, ss);
+                }
             }
-            addendum += '>';
+            ss << '>';
+            ss.flush();
             rewriter->InsertTextAfter(decl->getLocation(), addendum);
         }
 
@@ -226,42 +266,81 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
         //   This is much easier than trying to manually replace all occurrences of template parameters with concrete arguments.
         // * The parameter list is replaced by the FunctionDecl parameter list provided by clang. Stringifying this correctly
         //   is reasonably easy and gets rid of all template parameter references automatically.
-        if (decl->param_size()) {
+        //
+        // NOTE: We only need to replace anything for non-empty parameter lists, but note that a specialization's parameter list
+        //       may well be empty while the actual template function's parameter list is not. In particular, this happens for
+        //       template functions of the form
+        //
+        //           template<typename... T> void func(T... t)
+        //
+        //       when specialized for empty parameter packs.
+
+        auto templated_function_decl = decl->getPrimaryTemplate()->getTemplatedDecl();
+        std::transform(templated_function_decl->param_begin(), templated_function_decl->param_end(), std::back_inserter(current_function.parameters),
+                       [&](clang::ParmVarDecl* templated_param_decl) {
+                            // Unfortunately, there doesn't seem to be a better way to do this than to compare the parameters by name...
+                            auto is_same_decl = [&](const clang::ParmVarDecl* specialized_param_decl) {
+                                                 return (specialized_param_decl->getName() == templated_param_decl->getName());
+                                             };
+                            auto first_it = std::find_if (decl->param_begin(), decl->param_end(), is_same_decl);
+                            auto last_it = std::find_if_not(first_it, decl->param_end(), is_same_decl);
+                            return CurrentFunctionInfo::Parameter { templated_param_decl, std::vector(first_it, last_it) };
+                       });
+
+
+        if (decl->getPrimaryTemplate()->getTemplatedDecl()->param_size()) {
             std::string addendum;
 
-            clang::SourceLocation parameters_loc_start;
-            clang::SourceLocation parameters_loc_end;
+            clang::SourceLocation parameters_loc_start = decl->getPrimaryTemplate()->getTemplatedDecl()->parameters().front()->getLocStart();
+            clang::SourceLocation parameters_loc_end = decl->getPrimaryTemplate()->getTemplatedDecl()->parameters().back()->getLocEnd();
             bool first = true;
+            clang::ParmVarDecl* last_templated_parameter = nullptr; // Parameter in the templated function declaration, corresponding to the current specialized parameter
+            size_t templated_parameter_pack_counter = 0; // Counter used to assign distinguished names for parameters generated from a single parameter pack
             for (auto* parameter : decl->parameters()) {
                 if (!first) {
                     addendum += ", ";
                 } else {
-                    parameters_loc_start = parameter->getLocStart();
                     first = false;
                 }
-                // TODO: For on-the-fly declared template arguments like e.g. in "func<struct unnamed>()", this will print spam such as "struct(anonymous namespace)::unnamed". We neither want that namespace nor do we want the "struct" prefix!
-                // TODO: For parameter packs, this doesn't seem to include the "..." at the end!
-                parameters_loc_end = parameter->getLocEnd();
-
-                // TODO: Need to ensure names of parameter pack types are unique! (e.g. "T... val" may get expanded to "int val, int val", currently)
-
-                // TODO: CppInsights has a lot more code to handle getting the parameter name and type...
+                // TODO: For on-the-fly declared template arguments like e.g. in "func<struct unnamed>()", getAsString will print spam such as "struct(anonymous namespace)::unnamed". We neither want that namespace nor do we want the "struct" prefix!
+                // NOTE: CppInsights has a lot more code to handle getting the parameter name and type...
                 addendum += parameter->getType().getAsString();
-                addendum += " ";
-                addendum += parameter->getNameAsString();
+                if (!parameter->getNameAsString().empty()) {
+                    addendum += " ";
+                    addendum += parameter->getNameAsString();
+
+                    // Parameter generated from a parameter pack will be assigned the same name,
+                    // so we need to distinguish the generated parameter names manually.
+
+                    // To check if this parameter is part of an expanded parameter pack, find the
+                    // corresponding parameter in the primary function template.
+                    auto current_templated_parameter = current_function.FindTemplatedParamDecl(parameter);
+                    if (current_templated_parameter->isParameterPack()) {
+                        if (current_templated_parameter == last_templated_parameter) {
+                            ++templated_parameter_pack_counter;
+                        } else {
+                            last_templated_parameter = current_templated_parameter;
+                            templated_parameter_pack_counter = 1;
+                        }
+
+                        // TODO: This will break if there is already a parameter with the new name
+                        addendum += std::to_string(templated_parameter_pack_counter);
+                    } else {
+                        last_templated_parameter = nullptr;
+                        templated_parameter_pack_counter = 0;
+                    }
+                }
             }
             rewriter->ReplaceTextIncludingEndToken({ parameters_loc_start, parameters_loc_end }, addendum);
         }
     }
 
     // From here on below, assume we have a self-contained definition that we can freely rewrite code in
-    in_fully_specialized_function = true; // TODO: Reset this properly!
-    current_function = decl;
+    this->current_function = current_function;
 
     Parent::TraverseFunctionDecl(decl);
 
-    current_function = nullptr;
-    in_fully_specialized_function = false;
+    this->current_function = std::nullopt;
 
     if (specialize) {
         // Fix up references to template parameters in the specialization by adding an explicit
@@ -319,10 +398,9 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
                 // e.g. template<typename... Types>
                 // e.g. template<int... Vals>
                 // e.g. template<template<typename>... Templs>
-                // TODO: We need to manually expand parameter packs in the function body, which we don't support yet.
-                // TODO: Instead of ignoring this error, abort specializing this template
-                aliases += "TODO... " + parameter->getNameAsString() + " = TODO...;\n";
-                std::cerr << "WARNING: Parameter packs unsupported" << std::endl;
+
+                // We don't need to do anything here, since we expand all parameter packs in the function body
+                std::cerr << "WARNING: Variadic templates support is incomplete" << std::endl;
                 break;
 
             default:

@@ -46,7 +46,7 @@ bool ASTVisitor::VisitIfStmt(clang::IfStmt* stmt) {
         // TODO: Only use this if VisitFunctionDecl has ensured we can modify the current function!
     }
 
-    if (!in_fully_specialized_function) {
+    if (!IsInFullySpecializedFunction()) {
         return true;
     }
 
@@ -71,7 +71,7 @@ bool ASTVisitor::VisitIfStmt(clang::IfStmt* stmt) {
 
 
     assert(current_function);
-    if (current_function->getPrimaryTemplate()) {
+    if (current_function->decl->getPrimaryTemplate()) {
         // In function template specializations, clang overly helpfully strips out untaken else-branches right away...
         // While that could have been very convenient, it breaks our design since we these branches will still be in the
         // StagingRewriter, and now we don't get the SourceLocations of what needs to be removed.
@@ -80,7 +80,7 @@ bool ASTVisitor::VisitIfStmt(clang::IfStmt* stmt) {
         // have changed.
         // TODO: This probably breaks down for manually specialized functions
 
-        clang::IfStmt* original_statement = FinderForOriginalIfStmt(current_function, stmt);
+        clang::IfStmt* original_statement = FinderForOriginalIfStmt(current_function->decl, stmt);
         assert(original_statement);
         branch = result ? original_statement->getThen() : original_statement->getElse();
         stmt = original_statement;

@@ -21,6 +21,8 @@ class ASTVisitor : public clang::RecursiveASTVisitor<ASTVisitor> {
 public:
     ASTVisitor(clang::ASTContext& context, clang::Rewriter& rewriter_);
 
+    bool VisitSizeOfPackExpr(clang::SizeOfPackExpr* expr);
+
     bool VisitCXXFoldExpr(clang::CXXFoldExpr* expr);
 
     bool TraverseCXXFoldExpr(clang::CXXFoldExpr* expr);
@@ -39,6 +41,25 @@ public:
 
     bool shouldTraversePostOrder() const;
 
+    struct CurrentFunctionInfo {
+        clang::FunctionDecl* decl;
+
+        struct Parameter {
+            // decl in the primary function template
+            clang::ParmVarDecl* templated;
+
+            // decl in the specialized function.
+            // If "templated" is a parameter pack, there may be multiple decls here (or none)
+            // NOTE: This is populated only if the parameter is named!
+            std::vector<clang::ParmVarDecl*> specialized;
+        };
+
+        std::vector<Parameter> parameters;
+
+        clang::ParmVarDecl* FindTemplatedParamDecl(clang::ParmVarDecl* specialized) const;
+        const std::vector<clang::ParmVarDecl*>& FindSpecializedParamDecls(clang::ParmVarDecl* templated) const;
+    };
+
 private:
     // Gets the string of the contents enclosed by the two SourceLocations extended to the end of the last token
     clang::SourceLocation getLocForEndOfToken(clang::SourceLocation end);
@@ -49,8 +70,11 @@ private:
     clang::ASTContext& context;
     std::unique_ptr<RewriterBase> rewriter;
 
-    bool in_fully_specialized_function = false;
-    clang::FunctionDecl* current_function = nullptr;
+    bool IsInFullySpecializedFunction() const {
+        return current_function.has_value();
+    }
+
+    std::optional<CurrentFunctionInfo> current_function;
 };
 
 } // namespace cftf
