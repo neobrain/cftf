@@ -5,6 +5,8 @@
 #include <clang/AST/Expr.h>
 
 #include <iostream>
+#include <numeric>
+#include <variant>
 
 namespace cftf {
 
@@ -28,87 +30,120 @@ static bool IsSubRange(clang::SourceManager& sm, clang::SourceRange inner, clang
  * Rewriter that takes a copy of the given range and performs manipulations on
  * it based on original SourceLocations but without modifying the original text
  *
+ * In contrast to clang::Rewriter this class allows for "hierarchical"
+ * rewriting, where multiple rewrite rules might operate on nested parts
+ * of a single expressions (e.g. a parameter pack expansion including
+ * binary literals).
  */
-class StagingRewriter final : public RewriterBase {
+class HierarchicalRewriter final : public RewriterBase {
 public:
-    StagingRewriter(clang::SourceManager& sm, clang::SourceRange range)
-        : sm(sm), unmodified_contents({std::make_pair(std::string::size_type{0}, range)}), content(SourceRangeToString(sm, range)) {
+    HierarchicalRewriter(clang::SourceManager& sm, clang::SourceRange range)
+        : sm(sm), root{range, true, SourceRangeToString(sm, range)} {
     }
 
-    const std::string& GetContents() {
-        return content;
+    std::string GetContents() const {
+        return root.Concatenate();
     }
 
 private:
-    // TODO: Double-check this includes the end token or not
+    struct SourceNode {
+        // Half-open interval of source contained by this node. Beginning is included, end is not.
+        clang::SourceRange range;
+
+        // true if this is original, unmodified source data; false otherwise.
+        // if false, the contents of this child may not be split up during rewrites. In other words,
+        // the child must either be left untouched or replaced as a whole
+        bool rewriteable;
+
+        bool IsLeaf() const {
+            return std::holds_alternative<std::string>(data);
+        }
+
+        /// Child nodes or node content
+        std::variant<std::vector<SourceNode>, std::string> data;
+
+        std::vector<SourceNode>& GetChildren() {
+            return std::get<std::vector<SourceNode>>(data);
+        }
+
+        const std::vector<SourceNode>& GetChildren() const {
+            return std::get<std::vector<SourceNode>>(data);
+        }
+
+        std::string& GetContent() {
+            return std::get<std::string>(data);
+        }
+
+        std::string Concatenate() const {
+            if (IsLeaf()) {
+                return std::get<std::string>(data);
+            } else {
+                return std::accumulate(GetChildren().cbegin(), GetChildren().cend(), std::string{},
+                                       [](const std::string& str, const SourceNode& node) {
+                                           return str + node.Concatenate();
+                                       });
+            }
+        }
+    };
+
     bool ReplaceTextIncludingEndToken(clang::SourceRange subrange, llvm::StringRef new_str) override {
         clang::SourceRange extended_range {subrange.getBegin(), clang::Lexer::getLocForEndOfToken(subrange.getEnd(), 0, sm, {}) };
         return ReplaceTextExcludingEndToken(extended_range, new_str);
     }
 
-    // TODO: Remove these
-std::string GetClosedStringFor(clang::SourceLocation begin, clang::SourceLocation end) {
-    auto begin_data = sm.getCharacterData(begin);
-    auto end_data = sm.getCharacterData(clang::Lexer::getLocForEndOfToken(end, 0, sm, {}));
-    return std::string(begin_data, end_data - begin_data);
-}
-std::string GetClosedStringFor(clang::SourceRange range) {
-    auto begin_data = sm.getCharacterData(range.getBegin());
-    auto end_data = sm.getCharacterData(clang::Lexer::getLocForEndOfToken(range.getEnd(), 0, sm, {}));
-    return std::string(begin_data, end_data - begin_data);
-}
-    bool ReplaceTextExcludingEndToken(clang::SourceRange subrange, llvm::StringRef new_str) override {
-        std::cerr << "Attempting to replace subrange " << "\"" << GetClosedStringFor(subrange.getBegin(), subrange.getEnd()) << "\"" << std::endl;;
-        auto range_it = std::find_if(unmodified_contents.begin(), unmodified_contents.end(),
-                     [&](const auto& offset_and_range) {
-                         auto& [offset, range] = offset_and_range;
-                         return IsSubRange(sm, subrange, range);
-                     });
-        if (range_it == unmodified_contents.end()) {
-            assert(false);
+    // TODO: Remove this
+    std::string GetHalfOpenStringFor(clang::SourceRange range) {
+        auto begin_data = sm.getCharacterData(range.getBegin());
+        auto end_data = sm.getCharacterData(range.getEnd());
+        return std::string(begin_data, end_data - begin_data);
+    }
+    bool ReplaceTextExcludingEndToken(SourceNode& node, clang::SourceRange replaced_range, llvm::StringRef new_str) {
+        if (node.IsLeaf()) {
+            if (node.range == replaced_range) {
+                // Node coincides with replaced range, so just replace it directly
+                node.rewriteable = false;
+                node.data = new_str;
+            } else {
+                // Split this leaf into (up to) 3 children and replace the inner part
+                std::vector<SourceNode> children;
 
-            // Report error: Tried to replace an already modified range (or a range that didn't lie within the original range to begin with)
-            return true;
-        }
+                auto left_range = clang::SourceRange { node.range.getBegin(), replaced_range.getBegin() };
+                if (left_range.getBegin() != left_range.getEnd()) {
+                    children.emplace_back(SourceNode { left_range, true, GetHalfOpenStringFor(left_range) });
+                }
 
-        auto range = *range_it;
+                children.emplace_back(SourceNode { replaced_range, false, new_str });
 
-        auto subrange_length = SourceRangeLength(sm, subrange);
-        for (auto follower_it = std::prev(unmodified_contents.end()); follower_it != range_it; --follower_it) {
-            if (new_str.size() == subrange_length) {
-                break;
+                auto right_range = clang::SourceRange { replaced_range.getEnd(), node.range.getEnd() };
+                if (right_range.getBegin() != right_range.getEnd()) {
+                    children.emplace_back(SourceNode { right_range, true, GetHalfOpenStringFor(right_range) });
+                }
+
+                // If the node wasn't wholly covered, we should have more than one child now
+                assert(children.size() > 1);
+
+                node.data = std::move(children);
             }
-
-            // Relocate subsequent elements by TODO
-            auto new_offset = follower_it->first + new_str.size() - subrange_length;
-            assert(unmodified_contents.count(new_offset) == 0);
-            unmodified_contents.emplace(new_offset, follower_it->second);
-            follower_it = unmodified_contents.erase(follower_it);
-        }
-        unmodified_contents.erase(range_it);
-
-        std::cerr << "Replacing in \"" << content << "\": \""
-                  << content.substr(range.first + SourceRangeLength(sm, { range.second.getBegin(), subrange.getBegin() }), subrange_length)
-                  << "\"-> \"" << new_str.str() << "\"" << std::endl << std::endl << std::endl << std::endl;
-        content.replace(range.first + SourceRangeLength(sm, { range.second.getBegin(), subrange.getBegin() }), subrange_length, new_str);
-
-        // Begin of previously unmodified range - begin of replaced range
-        clang::SourceRange pre_subrange { range.second.getBegin(), subrange.getBegin() };
-        if (pre_subrange.getBegin() != pre_subrange.getEnd()) {
-            auto offset = range.first;
-            assert(offset < content.size());
-            unmodified_contents.emplace(offset, pre_subrange);
+        } else {
+            // Recurse into the smallest child that wholly covers replaced_range
+            auto& children = node.GetChildren();
+            auto child_it = std::find_if(children.begin(), children.end(),
+                                         [&](SourceNode& child) {
+                                             return IsSubRange(sm, replaced_range, child.range);
+                                         });
+            if (child_it == children.end()) {
+                // Not implemented, currently. Not sure if we need this?
+                assert(false);
+            } else {
+                ReplaceTextExcludingEndToken(*child_it, replaced_range, new_str);
+            }
         }
 
-        // End of replaced range - begin of previously unmodified range
-        clang::SourceRange post_subrange { subrange.getEnd(), range.second.getEnd() };
-        if (post_subrange.getBegin() != post_subrange.getEnd()) {
-            auto offset = range.first + SourceRangeLength(sm, { range.second.getBegin(), subrange.getBegin() }) + new_str.size();
-            assert(offset < content.size());
-            unmodified_contents.emplace(offset, post_subrange);
-        }
-
+        // Report success
         return false;
+    }
+    bool ReplaceTextExcludingEndToken(clang::SourceRange subrange, llvm::StringRef new_str) override {
+        return ReplaceTextExcludingEndToken(root, subrange, new_str);
     }
 
     clang::SourceManager& getSourceMgr() override {
@@ -117,13 +152,7 @@ std::string GetClosedStringFor(clang::SourceRange range) {
 
     clang::SourceManager& sm;
 
-    /**
-     * Map from offsets into the content string to unmodified original ranges.
-     */
-    std::map<std::string::size_type, clang::SourceRange> unmodified_contents;
-
-    // TODO: Might want to use a different data structure here. Maybe clang::RewriteRope?
-    std::string content;
+    SourceNode root;
 };
 
 /**
@@ -226,7 +255,7 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
         // Temporarily exchange our clang::Rewriter with an internal rewriter that writes to a copy of the current function (which will act as an explicit instantiation)
         // TODO: This will fail sooner or later; functions can be nested e.g. by declaring a class inside a function!
         assert(old_rewriter == nullptr);
-        old_rewriter = std::exchange(rewriter, std::make_unique<StagingRewriter>(rewriter->getSourceMgr(), clang::SourceRange{ decl->getLocStart(), getLocForEndOfToken(decl->getLocEnd()) }));
+        old_rewriter = std::exchange(rewriter, std::make_unique<HierarchicalRewriter>(rewriter->getSourceMgr(), clang::SourceRange{ decl->getLocStart(), getLocForEndOfToken(decl->getLocEnd()) }));
 
         // Add template argument list for this specialization
         {
@@ -415,7 +444,8 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
         }
         rewriter->InsertTextAfter(decl->getBody()->getLocStart(), aliases);
         std::swap(rewriter, old_rewriter);
-        rewriter->InsertTextAfter(decl->getLocEnd(), "\n\n// Specialization generated by CFTF\ntemplate<>\n" + static_cast<StagingRewriter*>(old_rewriter.get())->GetContents());
+        std::string content = static_cast<HierarchicalRewriter*>(old_rewriter.get())->GetContents();
+        rewriter->InsertTextAfter(decl->getLocEnd(), "\n\n// Specialization generated by CFTF\ntemplate<>\n" + content);
     }
 
     // TODO: When we're done with the last specialization of this function, remove the original template function definition!
