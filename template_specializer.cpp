@@ -20,11 +20,8 @@ static auto SourceRangeToString(clang::SourceManager& sm, clang::SourceRange ran
 }
 
 static bool IsSubRange(clang::SourceManager& sm, clang::SourceRange inner, clang::SourceRange outer) {
-    auto inner_begin = sm.getCharacterData(inner.getBegin());
-    auto outer_begin = sm.getCharacterData(outer.getBegin());
-    auto inner_end = sm.getCharacterData(inner.getEnd());
-    auto outer_end = sm.getCharacterData(outer.getEnd());
-    return (inner_begin >= outer_begin && inner_end <= outer_end);
+    return (sm.isPointWithin(inner.getBegin(), outer.getBegin(), outer.getEnd()) &&
+            sm.isPointWithin(inner.getEnd(), outer.getBegin(), outer.getEnd()));
 }
 
 /**
