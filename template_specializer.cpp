@@ -34,18 +34,27 @@ static bool IsSubRange(clang::SourceManager& sm, clang::SourceRange inner, clang
  * rewriting, where multiple rewrite rules might operate on nested parts
  * of a single expressions (e.g. a parameter pack expansion including
  * binary literals).
+ *
+ * This rewriter also supports copy-operations ("instances") such that
+ * consecutive edits of common subexpressions are visible in all instances
+ * while allowing to do individual edits as well.
+ *
+ * For example, when specializing the expression
+ *     "my_function((0b0010 * ts)...)"
+ * for ts=<5, 10, 'c'>, the following operations may be performed:
+ * a) The parameter pack expansion rules creates three instances of the
+ *    subexpression "(0b1000 * ts)..."
+ * b) The separator ", " is added to the first two instances
+ * c) The DeclRefExpr matcher replaces "ts" in each instance with a unique
+ *    numbered identifier (ts1, ts2, ts3)
+ * d) The IntegerLiteral matcher replaces 0b0010 with 2 in all instances
+ * The difference between (c) and (d) is that (c) edits each instance
+ * separately whereas in (d), the rewriter class automatically distributes the
+ * edit across all instances.
+ * The resulting generated source code is
+ *     "my_function((2 * ts1), (2 * ts2), (2 * ts3))".
  */
 class HierarchicalRewriter final : public RewriterBase {
-public:
-    HierarchicalRewriter(clang::SourceManager& sm, clang::SourceRange range)
-        : sm(sm), root{range, true, SourceRangeToString(sm, range)} {
-    }
-
-    std::string GetContents() const {
-        return root.Concatenate();
-    }
-
-private:
     struct SourceNode {
         // Half-open interval of source contained by this node. Beginning is included, end is not.
         clang::SourceRange range;
@@ -84,7 +93,114 @@ private:
                                        });
             }
         }
+
+        size_t node_id = 0;
+        size_t instance_id = 0;
+
+        static constexpr size_t all_instances = std::numeric_limits<size_t>::max();
+
+        bool operator==(const SourceNode& oth) const {
+            return range == oth.range && rewriteable == oth.rewriteable && data == oth.data && instance_id == oth.instance_id;
+        }
     };
+
+    size_t running_node_id = 1000;
+
+public:
+    struct InstanceHandle {
+    private:
+        InstanceHandle(SourceNode& node, SourceNode& parent) : node_id(node.node_id), parent_id(parent.node_id) {}
+        InstanceHandle(size_t node_id, size_t parent_id) : node_id(node_id), parent_id(parent_id) {}
+
+        // TODO: To support nested instances, these will likely need to be std::vectors of nodes in the future
+        size_t node_id;
+        size_t parent_id;
+
+        friend class HierarchicalRewriter;
+    };
+
+    HierarchicalRewriter(clang::SourceManager& sm, clang::SourceRange range)
+        : sm(sm), root{range, true, SourceRangeToString(sm, range)} {
+    }
+
+    std::string GetContents() const {
+        return root.Concatenate();
+    }
+
+    InstanceHandle MakeInstanceHandle(clang::SourceRange subrange) {
+        return MakeInstanceHandle(root, subrange);
+    }
+
+    SourceNode& FindNode(SourceNode& parent, size_t id) {
+        auto ptr = FindNodeHelper(parent, id);
+        assert(ptr);
+        return *ptr;
+    }
+
+    InstanceHandle CreateNewInstance(const InstanceHandle& base_instance) {
+        auto& parent = FindNode(root, base_instance.parent_id);
+        auto node = FindNode(parent, base_instance.node_id); // Copy intended
+        auto& children = parent.GetChildren();
+        auto node_it = std::find(children.begin(), children.end(), node);
+
+        // Find the most recent instance of this node, and insert a new instance after it
+        while (std::next(node_it) != children.end() && node_it->instance_id < std::next(node_it)->instance_id) {
+            ++node_it;
+        }
+
+        auto new_instance_id = 1 + node_it->instance_id;
+        auto new_instance = children.insert(node_it + 1, node);
+        new_instance->instance_id = new_instance_id;
+        new_instance->node_id = ++running_node_id;
+        return InstanceHandle { new_instance->node_id, base_instance.parent_id };
+    }
+
+    bool ReplaceTextExcludingEndToken(InstanceHandle& instance, clang::SourceRange replaced_range, llvm::StringRef new_str) {
+        return ReplaceTextExcludingEndToken(FindNode(root, instance.node_id), replaced_range, new_str);
+    }
+
+private:
+    SourceNode* FindNodeHelper(SourceNode& parent, size_t id) {
+        if (parent.node_id == id) {
+            return &parent;
+        }
+
+        if (parent.IsLeaf()) {
+            return nullptr;
+        } else {
+            for (auto& child : parent.GetChildren()) {
+                auto ptr = FindNodeHelper(child, id);
+                if (ptr) return ptr;
+            }
+            return nullptr;
+        }
+    }
+
+    // Returns a reference to the inner node
+    SourceNode& SplitNodeAt(SourceNode& node, clang::SourceRange subrange) {
+        std::vector<SourceNode> children;
+        size_t index_for_inner_node = 0;
+
+        auto left_range = clang::SourceRange { node.range.getBegin(), subrange.getBegin() };
+        if (left_range.getBegin() != left_range.getEnd()) {
+            children.emplace_back(SourceNode { left_range, true, GetHalfOpenStringFor(left_range), ++running_node_id });
+            index_for_inner_node = 1;
+        }
+
+        children.emplace_back(SourceNode { subrange, true, GetHalfOpenStringFor(subrange), ++running_node_id });
+
+        auto right_range = clang::SourceRange { subrange.getEnd(), node.range.getEnd() };
+        if (right_range.getBegin() != right_range.getEnd()) {
+            children.emplace_back(SourceNode { right_range, true, GetHalfOpenStringFor(right_range), ++running_node_id });
+        }
+
+        // If the node wasn't wholly covered, we should have more than one child now
+        assert(children.size() > 1);
+
+        node.data = std::move(children);
+
+        return node.GetChildren()[index_for_inner_node];
+    }
 
     bool ReplaceTextIncludingEndToken(clang::SourceRange subrange, llvm::StringRef new_str) override {
         clang::SourceRange extended_range {subrange.getBegin(), clang::Lexer::getLocForEndOfToken(subrange.getEnd(), 0, sm, {}) };
@@ -92,6 +208,7 @@ private:
     }
 
     // TODO: Remove this
+public:
     std::string GetHalfOpenStringFor(clang::SourceRange range) {
         auto begin_data = sm.getCharacterData(range.getBegin());
         auto end_data = sm.getCharacterData(range.getEnd());
@@ -105,24 +222,9 @@ private:
                 node.data = new_str;
             } else {
                 // Split this leaf into (up to) 3 children and replace the inner part
-                std::vector<SourceNode> children;
-
-                auto left_range = clang::SourceRange { node.range.getBegin(), replaced_range.getBegin() };
-                if (left_range.getBegin() != left_range.getEnd()) {
-                    children.emplace_back(SourceNode { left_range, true, GetHalfOpenStringFor(left_range) });
-                }
-
-                children.emplace_back(SourceNode { replaced_range, false, new_str });
-
-                auto right_range = clang::SourceRange { replaced_range.getEnd(), node.range.getEnd() };
-                if (right_range.getBegin() != right_range.getEnd()) {
-                    children.emplace_back(SourceNode { right_range, true, GetHalfOpenStringFor(right_range) });
-                }
-
-                // If the node wasn't wholly covered, we should have more than one child now
-                assert(children.size() > 1);
-
-                node.data = std::move(children);
+                auto& inner_node = SplitNodeAt(node, replaced_range);
+                inner_node.rewriteable = false;
+                inner_node.data = new_str;
             }
         } else {
             // Recurse into the smallest child that wholly covers replaced_range
@@ -135,7 +237,17 @@ private:
                 // Not implemented, currently. Not sure if we need this?
                 assert(false);
             } else {
-                ReplaceTextExcludingEndToken(*child_it, replaced_range, new_str);
+                // Recurse into the child (each instance separately)
+                size_t instance = 0;
+                auto instance_it = child_it;
+                while (instance_it != children.end() && instance_it->instance_id == instance) {
+                    ReplaceTextExcludingEndToken(*child_it, replaced_range, new_str);
+                    ++instance;
+                    ++instance_it;
+                }
+
+                // We should have reached either the end of children or the start of another block of instances
+                assert(instance_it == children.end() || instance_it->instance_id == 0);
             }
         }
 
@@ -145,6 +257,42 @@ private:
     bool ReplaceTextExcludingEndToken(clang::SourceRange subrange, llvm::StringRef new_str) override {
         return ReplaceTextExcludingEndToken(root, subrange, new_str);
     }
+
+    InstanceHandle MakeInstanceHandle(SourceNode& parent, clang::SourceRange subrange) {
+        if (parent.IsLeaf()) {
+            if (parent.range == subrange) {
+                // Bleh, generate a nested child, just so we don't need to look up the proper parent ourselves now...
+                SourceNode child = std::move(parent);
+                parent = SourceNode { child.range, child.rewriteable, std::vector(1, child), ++running_node_id };
+                return InstanceHandle { parent.GetChildren()[0], parent };
+            } else {
+                auto& inner_node = SplitNodeAt(parent, subrange);
+                return InstanceHandle { inner_node, parent };
+            }
+        } else {
+            auto& children = parent.GetChildren();
+            auto child_it = std::find_if(children.begin(), children.end(),
+                                        [&](SourceNode& child) {
+                                            return IsSubRange(sm, subrange, child.range);
+                                        });
+            if (child_it == children.end()) {
+                // Not implemented, currently. Not sure if we need this?
+                assert(false);
+                throw nullptr;
+            } else {
+                // Recurse into the child
+
+                // TODO: Support nested instances.
+                //       We will need to capture all different branches that
+                //       can reach the given subrange in the InstanceHandle
+                //       for this!
+                assert(std::next(child_it) == children.end() || std::next(child_it)->instance_id == 0);
+
+                return MakeInstanceHandle(*child_it, subrange);
+            }
+        }
+    }
+
 
     clang::SourceManager& getSourceMgr() override {
         return sm;
@@ -186,6 +334,89 @@ public:
     bool needs_specialization = false;
 };
 
+/**
+ * Utility AST visitor that determines the size of the parameter pack expanded
+ * by the given PackExpansionExpr based on an implicitly specialized
+ * FunctionDecl.
+ *
+ * This helper is provided because libclang provides no direct means of getting
+ * the size of a parameter pack used for a specialization of a variadic
+ * function template.
+ *
+ * Internally, this helper traverses the entire function (up to the point of
+ * parameter pack expansion) to find the immediate children of expansion_expr
+ * in the function body and to count the number of their appearances.
+ * When using this helper, be cautious about the performance implications of
+ * this full traversal.
+ *
+ * @note One might be tempted to assume we could just calculate the parameter
+ *       pack size as the difference between the total number of arguments used
+ *       for the current specialization and the number of non-variadic template
+ *       parameters. E.g. for "template<typename T, typename... Us> void f()"
+ *       and the specialization "f<int, char, char>", this would yield the
+ *       correct value 3 - 1 = 2.
+ *       However, that breaks e.g. for function templates like
+ *       "template<typename... Ts, typename... Us> void f(Us... u)".
+ *       Maybe this approach could work with less naive inference rules, but
+ *       I haven't further explored that idea.
+ *
+ * @note We also can't get this info from
+ *       FunctionDecl::getTemplateSpecializationInfo (which provides a
+ *       template argument list), since we don't know the expanded parameter
+ *       pack. We might get away with just taking any parameter pack contained
+ *       within the expanded expression, but there are contrived (and evil)
+ *       examples of referencing multiple parameter packs in the same
+ *       expansion.
+ *       That said, maybe this could be used as a faster default, and the full
+ *       function traversal could be used as a reliable fallback for contrived
+ *       examples.
+ */
+class DetermineParameterPackSizeVisitor : public clang::RecursiveASTVisitor<DetermineParameterPackSizeVisitor> {
+public:
+    DetermineParameterPackSizeVisitor(clang::FunctionDecl* decl, clang::PackExpansionExpr* expansion_expr) : expr(expansion_expr->getPattern()) {
+        TraverseFunctionDecl(decl);
+    }
+
+    operator size_t() const {
+        return count;
+    }
+
+    bool VisitStmt(clang::Stmt* stmt) {
+        // Compared for equality based on StmtClass and SourceLocations
+        // Find the first statement that was generated from the parameter pack expansion.
+        // We recognize this statement by comparing against the StmtClass and source location
+        auto is_generated_stmt = [this](clang::Stmt* candidate) {
+            if (clang::ImplicitCastExpr::classof(candidate)) {
+                // Generated expressions are often wrapped in a generated
+                // ImplicitCastExpr, so unfold that one by refering to the
+                // child instead.
+                // In particular, this occurs in expressions like "func((t)...)"
+
+                // There should only be one child in this expression
+                assert(std::distance(candidate->child_begin(), candidate->child_end()) == 1);
+
+                candidate = *candidate->child_begin();
+            }
+
+            return  candidate->getStmtClass() == expr->getStmtClass() &&
+                    candidate->getSourceRange() == expr->getSourceRange();
+        };
+        auto count = std::count_if(stmt->child_begin(), stmt->child_end(), is_generated_stmt);
+        if (count) {
+            this->count = count;
+            // Abort traversal if we found the expression (TODO: Does this abort the entire traversal or just move back to parent? Abort the entire thing if the latter!)
+            return false;
+        } else {
+            // Keep looking for a generated statement
+            // NOTE: If the parameter pack was empty, this algorithm will need to scan the entire function to detect that :/
+            return true;
+        }
+    }
+
+    clang::Expr* expr; // Pattern of the given PackExpansionExpr
+    size_t count = 0;
+};
+
 bool ASTVisitor::VisitFunctionTemplateDecl(clang::FunctionTemplateDecl*) {
     return true;
 }
@@ -198,8 +429,8 @@ clang::ParmVarDecl* ASTVisitor::CurrentFunctionInfo::FindTemplatedParamDecl(clan
     auto it = std::find_if(parameters.begin(), parameters.end(),
                            [specialized](const Parameter& param) {
                                auto it = std::find_if(param.specialized.begin(), param.specialized.end(),
-                                                      [=](clang::ParmVarDecl* decl) {
-                                                          return (decl == specialized);
+                                                      [=](const Parameter::SpecializedParameter& parameter) {
+                                                          return (parameter.decl == specialized);
                                                       });
                                return (it != param.specialized.end());
                            });
@@ -210,7 +441,7 @@ clang::ParmVarDecl* ASTVisitor::CurrentFunctionInfo::FindTemplatedParamDecl(clan
     return it->templated;
 }
 
-const std::vector<clang::ParmVarDecl*>& ASTVisitor::CurrentFunctionInfo::FindSpecializedParamDecls(clang::ParmVarDecl* templated) const {
+const std::vector<ASTVisitor::CurrentFunctionInfo::Parameter::SpecializedParameter>& ASTVisitor::CurrentFunctionInfo::FindSpecializedParamDecls(clang::ParmVarDecl* templated) const {
     auto it = std::find_if(parameters.begin(), parameters.end(),
                            [templated](const Parameter& param) {
                                return (param.templated == templated);
@@ -222,8 +453,47 @@ const std::vector<clang::ParmVarDecl*>& ASTVisitor::CurrentFunctionInfo::FindSpe
 
 // TODO: Move elsewhere
 bool ASTVisitor::VisitSizeOfPackExpr(clang::SizeOfPackExpr* expr) {
+    if (!current_function) {
+        return true;
+    }
     rewriter->ReplaceTextIncludingEndToken({ expr->getLocStart(), expr->getLocEnd() }, std::to_string(expr->getPackLength()));
     return true;
+}
+
+bool ASTVisitor::VisitPackExpansionExpr(clang::PackExpansionExpr* expr) {
+    // NOTE: We only ever visit this once, in the general template. So we need to iterate over all implicit specializations of this function and fill in the gaps ourselves later.
+    assert(current_function_template);
+    current_function_template->param_pack_expansions.push_back(FunctionTemplateInfo::ParamPackExpansionInfo{expr, std::vector<clang::DeclRefExpr*>{}});
+    std::cerr << "Visiting pack expansion, registering to " << current_function_template << std::endl;
+
+    return true;
+}
+
+bool ASTVisitor::TraversePackExpansionExpr(clang::PackExpansionExpr* expr) {
+    current_function_template->in_param_pack_expansion = true;
+    Parent::TraversePackExpansionExpr(expr);
+    current_function_template->in_param_pack_expansion = false;
+    return true;
+}
+
+bool ASTVisitor::VisitDeclRefExpr(clang::DeclRefExpr* expr) {
+    // Record uses of parameter packs within pack expansions
+
+    if (!current_function_template->in_param_pack_expansion) {
+        return true;
+    }
+
+    auto parm_var_decl = clang::dyn_cast<clang::ParmVarDecl>(expr->getDecl());
+    if (parm_var_decl && parm_var_decl->isParameterPack()) {
+        current_function_template->param_pack_expansions.back().referenced_packs.push_back(expr);
+    }
+    return true;
+}
+
+static std::string MakeUniqueParameterPackName(clang::ParmVarDecl* decl, size_t index) {
+    // Just append a 1-based counter for now
+    // TODO: This will break if there is already a parameter with the new name
+    return decl->getNameAsString() + std::to_string(1 + index);
 }
 
 bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
@@ -231,16 +501,20 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
 
     std::cerr << "Visiting FunctionDecl:" << std::endl;
     if (decl->getDescribedFunctionTemplate() != nullptr) {
-        // This is the actual template definition, which we don't care about:
-        // The rest of this function is concerned with explicitly generating
-        // what's usually an implicit template specialization. We need to do
-        // this for some rewriting rules to be effective, since some things
-        // cannot generally be rewritten in a dependent context.
-        // TODO: Instead of ignoring this, we should traverse it and gather
-        //       a list of things that are "awkward" to rewrite, e.g.
-        //       parameter pack expansions. Having this list available later
-        //       when creating the explicit specializations will hopefully
-        //       be useful.
+        // This is the actual template definition (i.e. not one of the
+        // specializations generated implicitly by clang). We do a prepass over
+        // the template definition to gather a list of things that would be
+        // difficult to rewrite otherwise, such as parameter pack expansions.
+
+        auto [it, ignored] = function_templates.emplace(decl, FunctionTemplateInfo{});
+        current_function_template = &it->second;
+        std::cerr << "Template: " << decl->getNameAsString() << std::endl;
+
+        Parent::TraverseFunctionDecl(decl);
+
+        // The rest of this function is concerned with generating explicit
+        // specializations from what's an implicit template specialization in
+        // libclang's AST. Hence, return early from this code path.
         return true;
     }
 
@@ -312,7 +586,22 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
                                              };
                             auto first_it = std::find_if (decl->param_begin(), decl->param_end(), is_same_decl);
                             auto last_it = std::find_if_not(first_it, decl->param_end(), is_same_decl);
-                            return CurrentFunctionInfo::Parameter { templated_param_decl, std::vector(first_it, last_it) };
+
+                            CurrentFunctionInfo::Parameter ret { templated_param_decl, {} };
+
+                            if (first_it + 1 == last_it) {
+                                // Just one argument
+                                ret.specialized.push_back({*first_it, templated_param_decl->getNameAsString()});
+                            } else {
+                                // Templated parameter refers to a parameter pack for which multiple (or none) arguments were generated;
+                                // to prevent name collisions, generate a unique name for each of them.
+                                for (auto it = first_it; it != last_it; ++it) {
+                                    std::string unique_name = MakeUniqueParameterPackName(templated_param_decl, std::distance(first_it, it));
+                                    ret.specialized.push_back({*it, std::move(unique_name)});
+                                }
+                            }
+
+                            return ret;
                        });
 
 
@@ -324,16 +613,19 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
             clang::SourceLocation parameters_loc_end = templated_function_decl->parameters().back()->getLocEnd();
             bool first_printed_parameter = true;
 
-            for (auto parameter_it = decl->param_begin(); parameter_it != decl->param_end();) {
-                // Check if we are in a block of parameters generated from a parameter pack,
-                // and if we are process the entire block at once
+            for (auto parameter_it = decl->param_begin(); parameter_it != decl->param_end(); /* parameter_it advanced below */) {
+                // Check if we are in a block of parameters generated from a parameter pack.
+                // In that case, process the entire pack at once, otherwise just process a single parameter.
                 size_t parameters_in_current_pack = 1;
                 auto templated_parameter = current_function.FindTemplatedParamDecl(*parameter_it);
-                if (templated_parameter && templated_parameter->isParameterPack()) {
-                    // TODO: Change API to return the Parameter directly so we don't need to do this utterly irrelevant lookup
-                    auto generated_parameters = current_function.FindSpecializedParamDecls(templated_parameter);
-                    parameters_in_current_pack = generated_parameters.size();
-                }
+                auto generated_parameters = std::invoke([&]() -> std::vector<CurrentFunctionInfo::Parameter::SpecializedParameter> {
+                    if (templated_parameter && templated_parameter->isParameterPack()) {
+                        return current_function.FindSpecializedParamDecls(templated_parameter);
+                    } else {
+                        return {};
+                    }
+                });
+                parameters_in_current_pack = std::max<size_t>(1, generated_parameters.size());
                 const auto parameter_pack_begin_it = parameter_it;
                 const auto parameter_pack_end_it   = parameter_it + parameters_in_current_pack;
 
@@ -351,14 +643,13 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
                     addendum += parameter->getType().getAsString();
                     if (!parameter->getNameAsString().empty()) {
                         addendum += " ";
-                        addendum += parameter->getNameAsString();
-
-                        // Parameter generated from a parameter pack will be assigned the same name,
-                        // so we need to distinguish the generated parameter names manually.
-
-                        if (templated_parameter->isParameterPack()) {
-                            // TODO: This will break if there is already a parameter with the new name
-                            addendum += std::to_string(1 + std::distance(parameter_pack_begin_it, parameter_it));
+                        if (!templated_parameter->isParameterPack()) {
+                            addendum += parameter->getNameAsString();
+                        } else {
+                            // Parameter generated from a parameter pack will be assigned the same name,
+                            // so we need to distinguish the generated parameter names manually.
+                            auto index = std::distance(parameter_pack_begin_it, parameter_it);
+                            addendum += generated_parameters[index].unique_name;
                         }
                     }
                 }
@@ -369,6 +660,58 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
 
     // From here on below, assume we have a self-contained definition that we can freely rewrite code in
     this->current_function = current_function;
+
+    // Patch up body (parameter pack expansions, fold expressions)
+    if (decl->getPrimaryTemplate()) {
+        auto current_function_template_it = function_templates.find(decl->getPrimaryTemplate()->getTemplatedDecl());
+        if (current_function_template_it != function_templates.end()) {
+            auto current_function_template = &current_function_template_it->second;
+            assert(current_function_template);
+
+            for (auto [pack_expansion_expr, pack_uses] : current_function_template->param_pack_expansions) {
+                auto rewriter = static_cast<HierarchicalRewriter*>(this->rewriter.get());
+                auto* pattern = pack_expansion_expr->getPattern();
+                auto range_end = clang::Lexer::getLocForEndOfToken(pack_expansion_expr->getEllipsisLoc(), 0, rewriter->getSourceMgr(), {});
+                auto base_instance = rewriter->MakeInstanceHandle({pattern->getLocStart(), range_end});
+
+                size_t pack_length = DetermineParameterPackSizeVisitor { decl, pack_expansion_expr };
+
+                std::vector<HierarchicalRewriter::InstanceHandle> instances;
+                for (size_t instance_id = 0; instance_id < pack_length; ++instance_id) {
+                    instances.push_back(rewriter->CreateNewInstance(base_instance));
+                }
+
+                // Delete the original pack expansion first, then re-add one copy for each parameter pack element
+                rewriter->ReplaceTextExcludingEndToken(base_instance, {pattern->getLocStart(), range_end}, "");
+
+                for (size_t instance_id = 0; instance_id < pack_length; ++instance_id) {
+                    // Insert separators for all but the last instance
+                    const char* replacement = ", ";
+                    if (instance_id == pack_length - 1) {
+                        // No separator needed, so just remove the ellipsis
+                        replacement = "";
+                    }
+                    rewriter->ReplaceTextExcludingEndToken(instances[instance_id], {pack_expansion_expr->getEllipsisLoc(), range_end}, replacement);
+
+                    // We generate unique names for function parameters
+                    // expanded from parameter packs. Those now need to be
+                    // patched into the function body whenever the parameter
+                    // pack is referenced.
+                    for (auto* pack_expr : pack_uses) {
+                        clang::SourceRange range = { pack_expr->getLocStart(), clang::Lexer::getLocForEndOfToken(pack_expr->getLocEnd(), 0, rewriter->getSourceMgr(), {}) };
+                        auto parm_var_decl = clang::dyn_cast<clang::ParmVarDecl>(pack_expr->getDecl());
+                        assert(parm_var_decl && parm_var_decl->isParameterPack());
+
+                        const auto& unique_name = current_function.FindSpecializedParamDecls(parm_var_decl)[instance_id].unique_name;
+                        rewriter->ReplaceTextExcludingEndToken(instances[instance_id], range, unique_name);
+                    }
+
+                    // TODO: Also patch "T..." uses in the function body
+                }
+            }
+        }
+    }
+
 
     Parent::TraverseFunctionDecl(decl);
 

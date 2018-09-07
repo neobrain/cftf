@@ -23,6 +23,12 @@ public:
 
     bool VisitSizeOfPackExpr(clang::SizeOfPackExpr* expr);
 
+    bool TraversePackExpansionExpr(clang::PackExpansionExpr* expr);
+
+    bool VisitPackExpansionExpr(clang::PackExpansionExpr* expr);
+
+    bool VisitDeclRefExpr(clang::DeclRefExpr* expr);
+
     bool VisitCXXFoldExpr(clang::CXXFoldExpr* expr);
 
     bool TraverseCXXFoldExpr(clang::CXXFoldExpr* expr);
@@ -48,17 +54,43 @@ public:
             // decl in the primary function template
             clang::ParmVarDecl* templated;
 
+            // Decl and unique name for parameter(s) in a CFTF-specialized
+            // function template. Note that there may be muliple of these,
+            // since multiple arguments may be passed for a single variadic
+            // template parameter
+            struct SpecializedParameter {
+                clang::ParmVarDecl* decl;
+
+                // Unique name generated for this argument: Generally, we just
+                // copy over the templated parameter name into this field,
+                // however for variadic parameters this would cause all
+                // arguments generated from a parameter pack to be assigned the
+                // same name.
+                std::string unique_name;
+            };
+
             // decl in the specialized function.
             // If "templated" is a parameter pack, there may be multiple decls here (or none)
             // NOTE: This is populated only if the parameter is named!
-            std::vector<clang::ParmVarDecl*> specialized;
+            std::vector<SpecializedParameter> specialized;
         };
 
         std::vector<Parameter> parameters;
 
         clang::ParmVarDecl* FindTemplatedParamDecl(clang::ParmVarDecl* specialized) const;
-        const std::vector<clang::ParmVarDecl*>& FindSpecializedParamDecls(clang::ParmVarDecl* templated) const;
+        const std::vector<Parameter::SpecializedParameter>& FindSpecializedParamDecls(clang::ParmVarDecl* templated) const;
     };
+
+    struct FunctionTemplateInfo {
+        // The DeclRefExpr are parameter packs referenced in the pack expansion
+        struct ParamPackExpansionInfo {
+            clang::PackExpansionExpr* expr;
+            std::vector<clang::DeclRefExpr*> referenced_packs;
+        };
+        std::vector<ParamPackExpansionInfo> param_pack_expansions;
+        bool in_param_pack_expansion = false;
+    };
+
 
 private:
     // Gets the string of the contents enclosed by the two SourceLocations extended to the end of the last token
@@ -75,6 +107,9 @@ private:
     }
 
     std::optional<CurrentFunctionInfo> current_function;
+    FunctionTemplateInfo* current_function_template;
+    std::unordered_map<clang::FunctionDecl*, FunctionTemplateInfo> function_templates;
+
 };
 
 } // namespace cftf
