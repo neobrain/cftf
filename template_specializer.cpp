@@ -322,6 +322,21 @@ public:
 };
 
 /**
+ * Returns true if the function
+ * i) uses "auto" or "decltype(auto)" for the return type
+ * ii) does not use trailing return type specification
+ */
+static bool FunctionReturnTypeIsDeducedFromBody(clang::ASTContext& context, clang::FunctionDecl* decl) {
+    clang::QualType returntype = decl->getReturnType();
+    auto auto_type = returntype->getContainedAutoType();
+    if (!auto_type) {
+        auto_type = returntype.getDesugaredType(context)->getContainedAutoType();
+    }
+
+    return (auto_type && !auto_type->hasAutoForTrailingReturnType());
+}
+
+/**
  * Utility AST visitor that traverses a function and checks whether there is a need
  * to explicitly specialize it (e.g. because other transformations depend on types being well-known)
  */
@@ -523,6 +538,17 @@ static std::string MakeUniqueParameterPackName(clang::ParmVarDecl* decl, size_t 
     return decl->getNameAsString() + std::to_string(1 + index);
 }
 
+// Replace a function's return type with the given string.
+// Note that if a function template specialization should be
+// rewritten, "decl" should be passed the templated FunctionDecl
+// instead since it's used to gather the SourceLocations.
+static void ReplaceReturnType(RewriterBase& rewriter, clang::FunctionDecl& decl, llvm::StringRef new_type) {
+    // NOTE: For "decltype(auto)", decl.getReturnTypeSourceRange() actually
+    //       stops at "(auto)", so we instead use its start location and then
+    //       replace everything up to the function name
+    rewriter.ReplaceTextExcludingEndToken({decl.getReturnTypeSourceRange().getBegin(), decl.getNameInfo().getLoc()}, new_type.str() + " ");
+}
+
 bool ASTVisitor::TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl* decl) {
     WalkUpFromFunctionTemplateDecl(decl);
 
@@ -549,6 +575,13 @@ bool ASTVisitor::TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl* decl)
     // specializations from what's an implicit template specialization in
     // libclang's AST. Hence, return early from this code path.
 
+    // TODO: There may be multiple overloads with the same function name but
+    //       different sets of deduced return values. To make sure we support
+    //       all of these, we need to append a *mangled* version of the
+    //       function name here!
+    const std::string auto_deduction_helper_struct_name = "cftf_deduced_return_type_" + decl->getNameAsString();
+    const bool deduce_return_type = FunctionReturnTypeIsDeducedFromBody(context, templated_decl);
+
     for (auto* specialized_decl : decl->specializations()) {
         std::cerr << "Specialization " << specialized_decl << std::endl;
 
@@ -561,6 +594,7 @@ bool ASTVisitor::TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl* decl)
         decltype(rewriter) old_rewriter;
 
         CurrentFunctionInfo current_function = { specialized_decl, {} };
+        std::string template_argument_string; // TODO: This is initialized below (two indentation levels deeper), which is rather ugly...
         if (specialize) {
             current_function.template_info = &function_templates.at(templated_decl);
 
@@ -571,9 +605,7 @@ bool ASTVisitor::TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl* decl)
 
             // Add template argument list for this specialization
             {
-                std::string addendum;
-                llvm::raw_string_ostream ss(addendum);
-                ss << '<';
+                llvm::raw_string_ostream ss(template_argument_string);
                 assert(specialized_decl->getTemplateSpecializationArgs());
                 auto&& template_args = specialized_decl->getTemplateSpecializationArgs()->asArray();
                 for (auto it = template_args.begin(); it != template_args.end(); ++it) {
@@ -593,10 +625,9 @@ bool ASTVisitor::TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl* decl)
                         it->print(policy, ss);
                     }
                 }
-                ss << '>';
                 ss.flush();
                 // TODO: Templated_decl locs!
-                rewriter->InsertTextAfter(specialized_decl->getLocation(), addendum);
+                rewriter->InsertTextAfter(specialized_decl->getLocation(), '<' + template_argument_string + '>');
             }
 
             // The template generally contains references to the template parameters (in the body and in the function parameter list).
@@ -794,20 +825,81 @@ bool ASTVisitor::TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl* decl)
                     break;
                 }
             }
+
             // TODO: Templated_decl locations
             rewriter->InsertTextAfter(specialized_decl->getBody()->getLocStart(), aliases);
+
+            ReplaceReturnType(*rewriter, *templated_decl, specialized_decl->getReturnType().getAsString());
+
+            // Return type deduction: Specialize helper type trait for the
+            // template arguments used in this function specialization
+            std::string deduced_return_type;
+            if (deduce_return_type) {
+                deduced_return_type = "template<>\nstruct " + auto_deduction_helper_struct_name + "<";
+                deduced_return_type += template_argument_string;
+                deduced_return_type += "> {\n    using type = ";
+                deduced_return_type += specialized_decl->getReturnType().getAsString();
+                deduced_return_type += ";\n};\n";
+            }
+
+            // Finalize the generated specialization
             std::swap(rewriter, old_rewriter);
             std::string content = static_cast<HierarchicalRewriter*>(old_rewriter.get())->GetContents();
-            rewriter->InsertTextAfter(specialized_decl->getLocEnd(), "\n\n// Specialization generated by CFTF\ntemplate<>\n" + content);
+            rewriter->InsertTextAfter(specialized_decl->getLocEnd(), "\n\n// Specialization generated by CFTF\n" + deduced_return_type + "\ntemplate<>\n" + content);
         }
-
-        // Now that all explicit specializations have been generated, remove
-        // the original template function definition since it still contains
-        // unmodified "future" C++ code
-        rewriter->ReplaceTextIncludingEndToken(templated_decl->getBody()->getSourceRange(), ";");
     }
 
-    // TODO: Adapt "auto" return type in function template declaration if necessary!
+    // TODO: Only if we actually explicitly specialized anything!
+    // Now that all explicit specializations have been generated, remove
+    // the original template function definition since it still contains
+    // unmodified "future" C++ code
+    rewriter->ReplaceTextIncludingEndToken(templated_decl->getBody()->getSourceRange(), ";");
+
+    // Replace "auto"/"decltype(auto)" return type with a deduced type
+    // (introduced in C++14 via N3638). Since the deduced type may depend on
+    // template parameters, this is done using a helper type trait that maps
+    // template arguments to the deduced return type
+    if (deduce_return_type) {
+        auto* template_parameters = decl->getTemplateParameters();
+
+        // First, declare the helper type trait (which will have a separate
+        // definition generated for each implicit specialization)
+        std::string deduced_return_type_decl = "template";
+        deduced_return_type_decl += GetClosedStringFor(template_parameters->getLAngleLoc(), template_parameters->getRAngleLoc());
+        deduced_return_type_decl += "\nstruct " + auto_deduction_helper_struct_name + ";\n\n";
+        // NOTE: templated_decl->getLocStart() starts *after* the
+        //       template<typename> part, so we indeed need decl->getLocStart()
+        //       here instead
+        rewriter->ReplaceTextExcludingEndToken({decl->getLocStart(), decl->getLocStart()}, deduced_return_type_decl);
+
+        // Second, replace "auto" by referring to the helper type trait
+        std::string deduced_return_type_string = "typename " + auto_deduction_helper_struct_name + "<";
+        bool first_parameter = true;
+        for (auto& parameter : template_parameters->asArray()) {
+            if (!first_parameter) {
+                deduced_return_type_string += ", ";
+            }
+            first_parameter = false;
+            deduced_return_type_string += parameter->getNameAsString();
+        }
+        deduced_return_type_string += ">::type";
+        ReplaceReturnType(*rewriter, *templated_decl, deduced_return_type_string);
+    }
+
+    return true;
+}
+
+bool ASTVisitor::VisitFunctionDecl(clang::FunctionDecl* decl) {
+    if (decl->getDescribedFunctionTemplate() || decl->isFunctionTemplateSpecialization()) {
+        // If this function is templated (either a generic definition or a
+        // specialization), skip it since we handled it in
+        // TraverseFunctionTemplateDecl already
+        return true;
+    }
+
+    if (FunctionReturnTypeIsDeducedFromBody(context, decl)) {
+        ReplaceReturnType(*rewriter, *decl, decl->getReturnType().getAsString());
+    }
 
     return true;
 }

@@ -40,6 +40,8 @@ public:
     // Used to explicitly specialize function templates which are otherwise specialized implicitly
     bool TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl* decl);
 
+    bool VisitFunctionDecl(clang::FunctionDecl* decl);
+
     bool VisitIfStmt(clang::IfStmt* stmt);
 
     bool VisitStaticAssertDecl(clang::StaticAssertDecl* decl);
