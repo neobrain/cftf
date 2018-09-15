@@ -550,6 +550,11 @@ static void ReplaceReturnType(RewriterBase& rewriter, clang::FunctionDecl& decl,
 }
 
 bool ASTVisitor::TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl* decl) {
+    if (context.getFullLoc(decl->getLocStart()).isInSystemHeader()) {
+        // Skip system header contents
+        return true;
+    }
+
     WalkUpFromFunctionTemplateDecl(decl);
 
     std::cerr << "Visiting FunctionTemplateDecl:" << decl << std::endl;
@@ -586,10 +591,6 @@ bool ASTVisitor::TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl* decl)
         std::cerr << "Specialization " << specialized_decl << std::endl;
 
         bool specialize = FunctionNeedsExplicitSpecializationChecker(specialized_decl);
-        if (specialize && context.getFullLoc(specialized_decl->getLocStart()).isInSystemHeader()) {
-            // Don't specialize functions from system headers
-            specialize = false;
-        }
 
         decltype(rewriter) old_rewriter;
 
