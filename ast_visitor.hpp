@@ -51,6 +51,8 @@ public:
 
     bool shouldTraversePostOrder() const;
 
+    bool shouldVisitTemplateInstantiations() const { return true; }
+
     struct FunctionTemplateInfo {
         // The DeclRefExpr are parameter packs referenced in the pack expansion
         struct ParamPackExpansionInfo {

@@ -158,30 +158,12 @@ class ASTConsumer : public clang::ASTConsumer {
 public:
     ASTConsumer(clang::Rewriter& rewriter) : rewriter(rewriter) {}
 
-    virtual void Initialize(clang::ASTContext& context) override {
-        visitor = std::make_unique<ASTVisitor>(context, rewriter);
-    }
-
-    bool HandleTopLevelDecl(clang::DeclGroupRef ref) override {
-        std::cerr << "\nASTConsumer handling top level declaration" << std::endl;
-
-        for (auto elem : ref) {
-            visitor->TraverseDecl(elem);
-            elem->dumpColor();
-        }
-
-        return true;
-    }
-
-    void HandleTranslationUnit(clang::ASTContext&) override {
-        std::cerr << "\nASTConsumer handling translation unit" << std::endl;
-        visitor.reset();
+    void HandleTranslationUnit(clang::ASTContext& context) override {
+        ASTVisitor{context, rewriter}.TraverseDecl(context.getTranslationUnitDecl());
     }
 
 private:
     clang::Rewriter& rewriter;
-
-    std::unique_ptr<ASTVisitor> visitor;
 };
 
 static std::string GetOutputFilename(llvm::StringRef input_filename) {
