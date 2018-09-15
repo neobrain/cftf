@@ -21,6 +21,10 @@ class ASTVisitor : public clang::RecursiveASTVisitor<ASTVisitor> {
 public:
     ASTVisitor(clang::ASTContext& context, clang::Rewriter& rewriter_);
 
+    bool VisitDeclStmt(clang::DeclStmt* stmt);
+
+    bool VisitVarDecl(clang::VarDecl* decl);
+
     bool VisitSizeOfPackExpr(clang::SizeOfPackExpr* expr);
 
     bool TraversePackExpansionExpr(clang::PackExpansionExpr* expr);
@@ -47,8 +51,27 @@ public:
 
     bool shouldTraversePostOrder() const;
 
+    struct FunctionTemplateInfo {
+        // The DeclRefExpr are parameter packs referenced in the pack expansion
+        struct ParamPackExpansionInfo {
+            clang::PackExpansionExpr* expr;
+            std::vector<clang::DeclRefExpr*> referenced_packs;
+        };
+        std::vector<ParamPackExpansionInfo> param_pack_expansions;
+        bool in_param_pack_expansion = false;
+
+        // List of all Decls in this template. Used for reverse-lookup in
+        // implicit specializations to find templated Decls from specialized
+        // ones.
+        std::vector<clang::Decl*> decls;
+
+        clang::Decl* FindTemplatedDecl(clang::SourceManager& sm, clang::Decl* specialized) const;
+    };
+
     struct CurrentFunctionInfo {
         clang::FunctionDecl* decl;
+
+        FunctionTemplateInfo* template_info;
 
         struct Parameter {
             // decl in the primary function template
@@ -81,16 +104,6 @@ public:
         const std::vector<Parameter::SpecializedParameter>& FindSpecializedParamDecls(clang::ParmVarDecl* templated) const;
     };
 
-    struct FunctionTemplateInfo {
-        // The DeclRefExpr are parameter packs referenced in the pack expansion
-        struct ParamPackExpansionInfo {
-            clang::PackExpansionExpr* expr;
-            std::vector<clang::DeclRefExpr*> referenced_packs;
-        };
-        std::vector<ParamPackExpansionInfo> param_pack_expansions;
-        bool in_param_pack_expansion = false;
-    };
-
 
 private:
     // Gets the string of the contents enclosed by the two SourceLocations extended to the end of the last token
@@ -107,7 +120,11 @@ private:
     }
 
     std::optional<CurrentFunctionInfo> current_function;
-    FunctionTemplateInfo* current_function_template;
+
+    // Only valid while traversing a template function.
+    // In particular, not valid in implicit specializations
+    FunctionTemplateInfo* current_function_template = nullptr;
+
     std::unordered_map<clang::FunctionDecl*, FunctionTemplateInfo> function_templates;
 
 };

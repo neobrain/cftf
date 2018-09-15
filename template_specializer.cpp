@@ -235,7 +235,25 @@ public:
                                          });
             if (child_it == children.end()) {
                 // Not implemented, currently. Not sure if we need this?
-                assert(false);
+                // No child contains the entire SourceRange found, so we'll replace all the children in this node that are covered.
+                auto child_is_fully_covered = [&](SourceNode& child) {
+                    bool fully_covered = IsSubRange(sm, child.range, replaced_range);
+                    return fully_covered;
+                };
+
+                auto first_child = std::find_if(children.begin(), children.end(), child_is_fully_covered);
+
+                // If replacement string is non-empty, replace the first matching child in-place and drop all other children.
+                // Otherwise, drop all matching children
+                auto first_child_to_remove = new_str.empty() ? first_child : (first_child + 1);
+                auto children_to_remove = std::remove_if(first_child_to_remove, children.end(), child_is_fully_covered);
+
+                if (!new_str.empty()) {
+                    clang::SourceLocation range_end = (children_to_remove != children.end()) ? children.back().range.getEnd() : first_child->range.getEnd();
+                    *first_child = SourceNode { { first_child->range.getBegin(), range_end }, false, new_str, ++running_node_id };
+                }
+
+                children.erase(children_to_remove, children.end());
             } else {
                 // Recurse into the child (each instance separately)
                 size_t instance = 0;
@@ -386,7 +404,17 @@ public:
         // Find the first statement that was generated from the parameter pack expansion.
         // We recognize this statement by comparing against the StmtClass and source location
         auto is_generated_stmt = [this](clang::Stmt* candidate) {
-            if (clang::ImplicitCastExpr::classof(candidate)) {
+            auto expected_stmt_class = expr->getStmtClass();
+
+            if (clang::CXXUnresolvedConstructExpr::classof(expr) && clang::CXXFunctionalCastExpr::classof(candidate)) {
+                // CXXUnresolvedConstructExprs get turned into
+                // CXXFunctionalCastExprsGenerated in implicit specializations.
+                // The SourceRange doesn't change, so we can still use it for
+                // the purpose of comparison.
+                // This was observed e.g. in "func(T{}...)".
+
+                expected_stmt_class = candidate->getStmtClass();
+            } else if (clang::ImplicitCastExpr::classof(candidate)) {
                 // Generated expressions are often wrapped in a generated
                 // ImplicitCastExpr, so unfold that one by refering to the
                 // child instead.
@@ -398,7 +426,7 @@ public:
                 candidate = *candidate->child_begin();
             }
 
-            return  candidate->getStmtClass() == expr->getStmtClass() &&
+            return  candidate->getStmtClass() == expected_stmt_class &&
                     candidate->getSourceRange() == expr->getSourceRange();
         };
         auto count = std::count_if(stmt->child_begin(), stmt->child_end(), is_generated_stmt);
@@ -456,13 +484,16 @@ bool ASTVisitor::VisitSizeOfPackExpr(clang::SizeOfPackExpr* expr) {
     if (!current_function) {
         return true;
     }
-    rewriter->ReplaceTextIncludingEndToken({ expr->getLocStart(), expr->getLocEnd() }, std::to_string(expr->getPackLength()));
+    rewriter->ReplaceTextIncludingEndToken({ expr->getLocStart(), expr->getLocEnd() }, "/*" + GetClosedStringFor(expr->getLocStart(), expr->getLocEnd()) + "*/" + std::to_string(expr->getPackLength()));
     return true;
 }
 
 bool ASTVisitor::VisitPackExpansionExpr(clang::PackExpansionExpr* expr) {
+    if (!current_function_template)
+        return true;
+
+
     // NOTE: We only ever visit this once, in the general template. So we need to iterate over all implicit specializations of this function and fill in the gaps ourselves later.
-    assert(current_function_template);
     current_function_template->param_pack_expansions.push_back(FunctionTemplateInfo::ParamPackExpansionInfo{expr, std::vector<clang::DeclRefExpr*>{}});
     std::cerr << "Visiting pack expansion, registering to " << current_function_template << std::endl;
 
@@ -470,6 +501,10 @@ bool ASTVisitor::VisitPackExpansionExpr(clang::PackExpansionExpr* expr) {
 }
 
 bool ASTVisitor::TraversePackExpansionExpr(clang::PackExpansionExpr* expr) {
+    if (!current_function_template)
+        return true;
+
+    assert(!current_function_template->in_param_pack_expansion);
     current_function_template->in_param_pack_expansion = true;
     Parent::TraversePackExpansionExpr(expr);
     current_function_template->in_param_pack_expansion = false;
@@ -479,7 +514,7 @@ bool ASTVisitor::TraversePackExpansionExpr(clang::PackExpansionExpr* expr) {
 bool ASTVisitor::VisitDeclRefExpr(clang::DeclRefExpr* expr) {
     // Record uses of parameter packs within pack expansions
 
-    if (!current_function_template->in_param_pack_expansion) {
+    if (!current_function_template || !current_function_template->in_param_pack_expansion) {
         return true;
     }
 
@@ -497,8 +532,6 @@ static std::string MakeUniqueParameterPackName(clang::ParmVarDecl* decl, size_t 
 }
 
 bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
-    decltype(rewriter) old_rewriter;
-
     std::cerr << "Visiting FunctionDecl:" << std::endl;
     if (decl->getDescribedFunctionTemplate() != nullptr) {
         // This is the actual template definition (i.e. not one of the
@@ -512,11 +545,15 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
 
         Parent::TraverseFunctionDecl(decl);
 
+        current_function_template = nullptr;
+
         // The rest of this function is concerned with generating explicit
         // specializations from what's an implicit template specialization in
         // libclang's AST. Hence, return early from this code path.
         return true;
     }
+
+    decltype(rewriter) old_rewriter;
 
     bool specialize = FunctionNeedsExplicitSpecializationChecker(decl);
     if (specialize && context.getFullLoc(decl->getLocStart()).isInSystemHeader()) {
@@ -526,6 +563,10 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
 
     CurrentFunctionInfo current_function = { decl, {} };
     if (specialize) {
+        auto current_function_template_it = function_templates.find(decl->getPrimaryTemplate()->getTemplatedDecl());
+        assert (current_function_template_it != function_templates.end());
+        current_function.template_info = &current_function_template_it->second;
+
         // Temporarily exchange our clang::Rewriter with an internal rewriter that writes to a copy of the current function (which will act as an explicit instantiation)
         // TODO: This will fail sooner or later; functions can be nested e.g. by declaring a class inside a function!
         assert(old_rewriter == nullptr);
@@ -605,56 +646,28 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
                        });
 
 
-        // Replace template parameters in the specialized signature with the actual template parameters
-        if (templated_function_decl->param_size()) {
-            std::string addendum;
+        // Remove empty parameter packs from the specialized signature
+        // (Non-empty parameter packs are handled in VisitVarDecl)
+        for (auto templated_parameter_it = templated_function_decl->param_begin();
+                templated_parameter_it != templated_function_decl->param_end();
+                ++templated_parameter_it) {
+            auto* templated_parameter = *templated_parameter_it;
+            if (templated_parameter->isParameterPack() && current_function.FindSpecializedParamDecls(templated_parameter).empty()) {
+                const bool is_first_parameter = (templated_parameter_it == templated_function_decl->param_end());
+                const bool is_last_parameter = (std::next(templated_parameter_it) == templated_function_decl->param_end());
 
-            clang::SourceLocation parameters_loc_start = templated_function_decl->parameters().front()->getLocStart();
-            clang::SourceLocation parameters_loc_end = templated_function_decl->parameters().back()->getLocEnd();
-            bool first_printed_parameter = true;
-
-            for (auto parameter_it = decl->param_begin(); parameter_it != decl->param_end(); /* parameter_it advanced below */) {
-                // Check if we are in a block of parameters generated from a parameter pack.
-                // In that case, process the entire pack at once, otherwise just process a single parameter.
-                size_t parameters_in_current_pack = 1;
-                auto templated_parameter = current_function.FindTemplatedParamDecl(*parameter_it);
-                auto generated_parameters = std::invoke([&]() -> std::vector<CurrentFunctionInfo::Parameter::SpecializedParameter> {
-                    if (templated_parameter && templated_parameter->isParameterPack()) {
-                        return current_function.FindSpecializedParamDecls(templated_parameter);
-                    } else {
-                        return {};
-                    }
-                });
-                parameters_in_current_pack = std::max<size_t>(1, generated_parameters.size());
-                const auto parameter_pack_begin_it = parameter_it;
-                const auto parameter_pack_end_it   = parameter_it + parameters_in_current_pack;
-
-                for (; parameter_it != parameter_pack_end_it; ++parameter_it) {
-                    assert(parameter_it != decl->param_end());
-                    auto* parameter = *parameter_it;
-
-                    if (!first_printed_parameter) {
-                        addendum += ", ";
-                    } else {
-                        first_printed_parameter = false;
-                    }
-                    // TODO: For on-the-fly declared template arguments like e.g. in "func<struct unnamed>()", getAsString will print spam such as "struct(anonymous namespace)::unnamed". We neither want that namespace nor do we want the "struct" prefix!
-                    // NOTE: CppInsights has a lot more code to handle getting the parameter name and type...
-                    addendum += parameter->getType().getAsString();
-                    if (!parameter->getNameAsString().empty()) {
-                        addendum += " ";
-                        if (!templated_parameter->isParameterPack()) {
-                            addendum += parameter->getNameAsString();
-                        } else {
-                            // Parameter generated from a parameter pack will be assigned the same name,
-                            // so we need to distinguish the generated parameter names manually.
-                            auto index = std::distance(parameter_pack_begin_it, parameter_it);
-                            addendum += generated_parameters[index].unique_name;
-                        }
-                    }
+                // Remove the parameter (including any preceding or following commas)
+                clang::SourceLocation start_loc = is_first_parameter ? templated_function_decl->parameters().front()->getLocStart() : templated_parameter->getLocStart();
+                if (is_last_parameter) {
+                    // Delete up to the end of the function signature
+                    clang::SourceLocation end_loc = templated_function_decl->parameters().back()->getLocEnd();
+                    rewriter->ReplaceTextIncludingEndToken({start_loc, end_loc}, "");
+                } else {
+                    // Delete up to the beginning of the next parameter
+                    auto end_loc = (*std::next(templated_parameter_it))->getLocStart();
+                    rewriter->ReplaceTextExcludingEndToken({start_loc, end_loc}, "");
                 }
             }
-            rewriter->ReplaceTextIncludingEndToken({ parameters_loc_start, parameters_loc_end }, addendum);
         }
     }
 
@@ -682,7 +695,7 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
                 }
 
                 // Delete the original pack expansion first, then re-add one copy for each parameter pack element
-                rewriter->ReplaceTextExcludingEndToken(base_instance, {pattern->getLocStart(), range_end}, "");
+                rewriter->ReplaceTextExcludingEndToken(base_instance, {pattern->getLocStart(), range_end}, "/*" + GetClosedStringFor(pattern->getLocStart(), range_end) + " of size " + std::to_string(pack_length) + "*/");
 
                 for (size_t instance_id = 0; instance_id < pack_length; ++instance_id) {
                     // Insert separators for all but the last instance
@@ -711,7 +724,6 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
             }
         }
     }
-
 
     Parent::TraverseFunctionDecl(decl);
 
@@ -795,5 +807,211 @@ bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
 
     return true;
 }
+
+static std::string RebuildVarDecl(clang::SourceManager& sm, clang::VarDecl* decl) {
+    // TODO: Turn types like pseudo-code "(int[5])&& array" (currently printed as "int &&[5] t") into "int (&&t)[5]"
+    std::string new_decl = clang::QualType::getAsString(decl->getType().getSplitDesugaredType(), clang::PrintingPolicy{{}});
+    new_decl +=  ' ' + decl->getName().str();
+    if (auto init = decl->getInit()) {
+        new_decl += " = " + SourceRangeToString(sm, { init->getLocStart(), clang::Lexer::getLocForEndOfToken(init->getLocEnd(), 0, sm, {})});
+    }
+    return new_decl;
+}
+
+namespace ranges {
+
+template<typename It, typename EndIt>
+struct reverse_iterator {
+    reverse_iterator& operator++() {
+        --it;
+        return *this;
+    }
+
+    auto operator* () {
+        return *std::prev(it);
+    }
+
+    auto operator* () const {
+        return *std::prev(it);
+    }
+
+    bool operator!=(reverse_iterator oth) {
+        return it != oth.it;
+    }
+
+    It it;
+};
+
+template<typename Rng>
+struct reversed {
+    using ForwardIt = decltype(std::declval<Rng>().begin());
+    using ForwardEndIt = decltype(std::declval<Rng>().end());
+
+    using iterator = reverse_iterator<ForwardIt, ForwardEndIt>;
+
+    reversed(Rng&& rng) : rng(std::forward<Rng>(rng)) {}
+
+    iterator begin() const {
+        return { rng.end() };
+    }
+
+    iterator end() const {
+        return { rng.begin() };
+    }
+
+    Rng&& rng;
+};
+
+} // namespace ranges
+
+bool ASTVisitor::VisitDeclStmt(clang::DeclStmt* stmt) {
+    if (!IsInFullySpecializedFunction()) {
+        return true;
+    }
+
+    // The types used in declarations might be dependent on template
+    // parameters. That's not an issue usually since we re-export template
+    // parameter names in the specialized template, however for parameter packs
+    // this cannot be done. In those cases, we just replace the declaration
+    // type by the desugared type to get rid of the template parameter uses.
+    //
+    // Clang doesn't provide us with the SourceLocations to the type, so
+    // we need to replace the entire declaration with a manually crafted one
+    // instead of replacing just the type.
+    //
+    // When doing these rewrites, we need to be careful about multiple
+    // variables declared in the same line,
+    // e.g. "stuff<T> first, *second = &first;").
+    // The easiest way to make sure we do this correctly is to just split up
+    // the declarations into separate statements.
+
+    for (auto decl : ranges::reversed(stmt->decls())) {
+        if (auto var_decl = clang::dyn_cast<clang::VarDecl>(decl)) {
+            // TODO: This needs to be more sophisticated for inplace-defined struct types!
+            auto new_decl = RebuildVarDecl(rewriter->getSourceMgr(), var_decl) + ';';
+            rewriter->InsertTextAfter(clang::Lexer::getLocForEndOfToken(stmt->getLocEnd(), 0, rewriter->getSourceMgr(), {}), new_decl);
+        } else if (clang::StaticAssertDecl::classof(decl)) {
+            // Nothing to do
+        } else {
+            std::cerr << "WARNING: Unimplemented Decl: " << decl->getDeclKindName() << std::endl;
+        }
+    }
+
+    // Delete the old declaration(s)
+    rewriter->ReplaceTextIncludingEndToken(stmt->getSourceRange(), "");
+
+    return true;
+}
+
+clang::Decl* ASTVisitor::FunctionTemplateInfo::FindTemplatedDecl(clang::SourceManager& sm, clang::Decl* specialized) const {
+    auto is_templated_decl = [&sm,specialized](clang::Decl* candidate) {
+        // Heuristic to match Decls against each other:
+        // * DeclKind must be the same
+        // * The SourceRange of the specialized Decl must be fully covered by
+        //   the templated one (they don't need to be equal because specialized
+        //   Decls may e.g. exclude the "..." from parameter packs, etc)
+        return  candidate->getKind() == specialized->getKind() &&
+                sm.isPointWithin(specialized->getLocStart(), candidate->getLocStart(), candidate->getLocEnd()) &&
+                sm.isPointWithin(specialized->getLocEnd(), candidate->getLocStart(), candidate->getLocEnd());
+    };
+
+    auto match_it = std::find_if(decls.begin(), decls.end(), is_templated_decl);
+    if (match_it == decls.end()) {
+        return nullptr;
+    }
+    return *match_it;
+}
+
+bool ASTVisitor::VisitVarDecl(clang::VarDecl* decl) {
+    if (!IsInFullySpecializedFunction()) {
+        if (current_function_template) {
+            current_function_template->decls.push_back(decl);
+        }
+        return true;
+    }
+
+    // TODO: If the type of the declared variable is dependent on a template parameter, replace it
+    // NOTE: We only need to replace dependent types, but since it would be extra work to determine whether a type is dependent, we just apply this transformation to all types for now
+    //       TODO: To reduce the danger of incorrect transformations, we should probably put in the extra work :/
+
+    {
+        // NOTE: getParents() only seems to return reliable results when called
+        //       on the templated declaration rather than on decl directly.
+        auto templated_decl = current_function->template_info->FindTemplatedDecl(rewriter->getSourceMgr(), decl);
+        assert(templated_decl);
+        auto parents = context.getParents(*templated_decl);
+        auto node_is_decl_stmt = [](auto& node) {
+            auto ptr = node.template get<clang::Stmt>();
+            return ptr && clang::DeclStmt::classof(ptr);
+        };
+        if (std::any_of(parents.begin(), parents.end(), node_is_decl_stmt)) {
+            std::cerr << "Skipping VarDecl visitation because it was already handled in VisitDeclStmt" << std::endl;
+            return true;
+        }
+    }
+
+
+    // Ideally, we'd just rewrite the type in this declaration. However, libclang provides no way to get the SourceRange for this, so we instead rebuild a new declaration from scratch...
+    // NOTE: We silently drop the default arguments from the specialized
+    //       signature. Keeping them certainly wouldn't be legal C++, since
+    //       they are just the same as specified in the templated function
+    //       declaration.
+    auto new_decl = RebuildVarDecl(rewriter->getSourceMgr(), decl);
+    if (auto pv_decl = clang::dyn_cast<clang::ParmVarDecl>(decl)) {
+        // This is part of a function signature, so the declaration needs more
+        // complicated treatment than other declarations since it could have
+        // been generated from an expanded parameter pack
+
+        auto templated = current_function->FindTemplatedParamDecl(pv_decl);
+        assert(templated);
+
+        if (templated->isParameterPack()) {
+            std::string addendum;
+            bool first_parameter = true;
+            for (auto& parameter_and_unique_name : current_function->FindSpecializedParamDecls(templated)) {
+                auto* parameter = parameter_and_unique_name.decl;
+
+                if (!first_parameter) {
+                    addendum += ", ";
+                }
+                first_parameter = false;
+
+                // TODO: For on-the-fly declared template arguments like e.g. in "func<struct unnamed>()", getAsString will print spam such as "struct(anonymous namespace)::unnamed". We neither want that namespace nor do we want the "struct" prefix!
+                // NOTE: CppInsights has a lot more code to handle getting the parameter name and type...
+                addendum += parameter->getType().getAsString();
+                if (!parameter->getNameAsString().empty()) {
+                    addendum += " ";
+                    // Parameter generated from a parameter pack will be assigned the same name,
+                    // so we need to distinguish the generated parameter names manually.
+                    addendum += parameter_and_unique_name.unique_name;
+                }
+            }
+
+            // NOTE: decl->getLocEnd() and templated->getLocEnd() return
+            //       different results in some cases. E.g. for
+            //       "decltype(T{}) t", the former coincides with the start of
+            //       the declaration, whereas the latter correctly spans the
+            //       entire declaration. Similarly, for unnamed parameter packs
+            //       such as "T...", decl->getLocEnd() stops before the
+            //       ellipsis, whereas templated->getLocEnd() includes it
+            rewriter->ReplaceTextIncludingEndToken(templated->getSourceRange(), "/*Expansion of " + GetClosedStringFor(decl->getLocStart(), templated->getLocEnd()) + "{-*/" + addendum + "/*-}*/");
+        } else {
+            auto old_decl = GetClosedStringFor(decl->getLocStart(), decl->getLocEnd());
+            if (new_decl != old_decl) {
+                rewriter->ReplaceTextIncludingEndToken(decl->getSourceRange(), "/*" + old_decl + "*/" + new_decl);
+            } else {
+                std::cerr << "Skipped rewrite due to matching declarations" << std::endl;
+            }
+        }
+    } else {
+        // NOTE: In particular, VarDecls should always have been handled as
+        //       part of VisitDeclStmt
+        std::cerr << "Unknown VarDecl kind " << decl->getDeclKindName() << std::endl;
+        assert(false);
+    }
+
+    return true;
+}
+
 
 } // namespace cftf
