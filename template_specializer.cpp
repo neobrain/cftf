@@ -531,279 +531,287 @@ static std::string MakeUniqueParameterPackName(clang::ParmVarDecl* decl, size_t 
     return decl->getNameAsString() + std::to_string(1 + index);
 }
 
-bool ASTVisitor::TraverseFunctionDecl(clang::FunctionDecl* decl) {
-    std::cerr << "Visiting FunctionDecl:" << std::endl;
-    if (decl->getDescribedFunctionTemplate() != nullptr) {
+bool ASTVisitor::TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl* decl) {
+    WalkUpFromFunctionTemplateDecl(decl);
+
+    std::cerr << "Visiting FunctionTemplateDecl:" << decl << std::endl;
+    auto templated_decl = decl->getTemplatedDecl();
+    {
         // This is the actual template definition (i.e. not one of the
         // specializations generated implicitly by clang). We do a prepass over
         // the template definition to gather a list of things that would be
         // difficult to rewrite otherwise, such as parameter pack expansions.
 
-        auto [it, ignored] = function_templates.emplace(decl, FunctionTemplateInfo{});
+        auto [it, ignored] = function_templates.emplace(templated_decl, FunctionTemplateInfo{});
         current_function_template = &it->second;
-        std::cerr << "Template: " << decl->getNameAsString() << std::endl;
+        std::cerr << "Template: " << templated_decl->getNameAsString() << std::endl;
 
-        Parent::TraverseFunctionDecl(decl);
+        // TODO: Will we traverse this decl twice now?
+        Parent::TraverseFunctionDecl(templated_decl);
 
         current_function_template = nullptr;
 
-        // The rest of this function is concerned with generating explicit
-        // specializations from what's an implicit template specialization in
-        // libclang's AST. Hence, return early from this code path.
-        return true;
     }
 
-    decltype(rewriter) old_rewriter;
+    // The rest of this function is concerned with generating explicit
+    // specializations from what's an implicit template specialization in
+    // libclang's AST. Hence, return early from this code path.
 
-    bool specialize = FunctionNeedsExplicitSpecializationChecker(decl);
-    if (specialize && context.getFullLoc(decl->getLocStart()).isInSystemHeader()) {
-        // Don't specialize functions from system headers
-        specialize = false;
-    }
+    for (auto* specialized_decl : decl->specializations()) {
+        std::cerr << "Specialization " << specialized_decl << std::endl;
 
-    CurrentFunctionInfo current_function = { decl, {} };
-    if (specialize) {
-        auto current_function_template_it = function_templates.find(decl->getPrimaryTemplate()->getTemplatedDecl());
-        assert (current_function_template_it != function_templates.end());
-        current_function.template_info = &current_function_template_it->second;
-
-        // Temporarily exchange our clang::Rewriter with an internal rewriter that writes to a copy of the current function (which will act as an explicit instantiation)
-        // TODO: This will fail sooner or later; functions can be nested e.g. by declaring a class inside a function!
-        assert(old_rewriter == nullptr);
-        old_rewriter = std::exchange(rewriter, std::make_unique<HierarchicalRewriter>(rewriter->getSourceMgr(), clang::SourceRange{ decl->getLocStart(), getLocForEndOfToken(decl->getLocEnd()) }));
-
-        // Add template argument list for this specialization
-        {
-            std::string addendum;
-            llvm::raw_string_ostream ss(addendum);
-            ss << '<';
-            assert(decl->getTemplateSpecializationArgs());
-            auto&& template_args = decl->getTemplateSpecializationArgs()->asArray();
-            for (auto it = template_args.begin(); it != template_args.end(); ++it) {
-                if (it != template_args.begin()) {
-                    ss << ", ";
-                }
-                clang::LangOptions policy; // TODO: Get this from the proper source!
-                if (it->getKind() == clang::TemplateArgument::Pack) {
-                    // Print each item in the parameter pack individually
-                    for (auto pack_it = it->pack_begin(); pack_it < it->pack_end(); ++pack_it) {
-                        if (pack_it != it->pack_begin()) {
-                            ss << ", ";
-                        }
-                        pack_it->print(policy, ss);
-                    }
-                } else {
-                    it->print(policy, ss);
-                }
-            }
-            ss << '>';
-            ss.flush();
-            rewriter->InsertTextAfter(decl->getLocation(), addendum);
+        bool specialize = FunctionNeedsExplicitSpecializationChecker(specialized_decl);
+        if (specialize && context.getFullLoc(specialized_decl->getLocStart()).isInSystemHeader()) {
+            // Don't specialize functions from system headers
+            specialize = false;
         }
 
-        // The template generally contains references to the template parameters (in the body and in the function parameter list).
-        // This is a problem in our generated specializations, which don't define the template parameters (i.e. there is no
-        // "template<typename T>" preceding them) but must use the actual template arguments instead.
-        // We address this as follows:
-        // * In the specialization body, we insert type aliases and constants at the top to manually declare template parameters.
-        //   This is much easier than trying to manually replace all occurrences of template parameters with concrete arguments.
-        // * The parameter list is replaced by the FunctionDecl parameter list provided by clang. Stringifying this correctly
-        //   is reasonably easy and gets rid of all template parameter references automatically.
-        //
-        // NOTE: We only need to replace anything for non-empty parameter lists, but note that a specialization's parameter list
-        //       may well be empty while the actual template function's parameter list is not. In particular, this happens for
-        //       template functions of the form
-        //
-        //           template<typename... T> void func(T... t)
-        //
-        //       when specialized for empty parameter packs.
+        decltype(rewriter) old_rewriter;
 
-        auto templated_function_decl = decl->getPrimaryTemplate()->getTemplatedDecl();
-        std::transform(templated_function_decl->param_begin(), templated_function_decl->param_end(), std::back_inserter(current_function.parameters),
-                       [&](clang::ParmVarDecl* templated_param_decl) {
-                            // Unfortunately, there doesn't seem to be a better way to do this than to compare the parameters by name...
-                            auto is_same_decl = [&](const clang::ParmVarDecl* specialized_param_decl) {
-                                                 return (specialized_param_decl->getName() == templated_param_decl->getName());
-                                             };
-                            auto first_it = std::find_if (decl->param_begin(), decl->param_end(), is_same_decl);
-                            auto last_it = std::find_if_not(first_it, decl->param_end(), is_same_decl);
+        CurrentFunctionInfo current_function = { specialized_decl, {} };
+        if (specialize) {
+            current_function.template_info = &function_templates.at(templated_decl);
 
-                            CurrentFunctionInfo::Parameter ret { templated_param_decl, {} };
+            // Temporarily exchange our clang::Rewriter with an internal rewriter that writes to a copy of the current function (which will act as an explicit instantiation)
+            // TODO: This will fail sooner or later; functions can be nested e.g. by declaring a class inside a function!
+            // TODO: Should probably use the locations from templated_decl instead!
+            old_rewriter = std::exchange(rewriter, std::make_unique<HierarchicalRewriter>(rewriter->getSourceMgr(), clang::SourceRange{ specialized_decl->getLocStart(), getLocForEndOfToken(specialized_decl->getLocEnd()) }));
 
-                            if (first_it + 1 == last_it) {
-                                // Just one argument
-                                ret.specialized.push_back({*first_it, templated_param_decl->getNameAsString()});
-                            } else {
-                                // Templated parameter refers to a parameter pack for which multiple (or none) arguments were generated;
-                                // to prevent name collisions, generate a unique name for each of them.
-                                for (auto it = first_it; it != last_it; ++it) {
-                                    std::string unique_name = MakeUniqueParameterPackName(templated_param_decl, std::distance(first_it, it));
-                                    ret.specialized.push_back({*it, std::move(unique_name)});
-                                }
+            // Add template argument list for this specialization
+            {
+                std::string addendum;
+                llvm::raw_string_ostream ss(addendum);
+                ss << '<';
+                assert(specialized_decl->getTemplateSpecializationArgs());
+                auto&& template_args = specialized_decl->getTemplateSpecializationArgs()->asArray();
+                for (auto it = template_args.begin(); it != template_args.end(); ++it) {
+                    if (it != template_args.begin()) {
+                        ss << ", ";
+                    }
+                    clang::LangOptions policy; // TODO: Get this from the proper source!
+                    if (it->getKind() == clang::TemplateArgument::Pack) {
+                        // Print each item in the parameter pack individually
+                        for (auto pack_it = it->pack_begin(); pack_it < it->pack_end(); ++pack_it) {
+                            if (pack_it != it->pack_begin()) {
+                                ss << ", ";
                             }
-
-                            return ret;
-                       });
-
-
-        // Remove empty parameter packs from the specialized signature
-        // (Non-empty parameter packs are handled in VisitVarDecl)
-        for (auto templated_parameter_it = templated_function_decl->param_begin();
-                templated_parameter_it != templated_function_decl->param_end();
-                ++templated_parameter_it) {
-            auto* templated_parameter = *templated_parameter_it;
-            if (templated_parameter->isParameterPack() && current_function.FindSpecializedParamDecls(templated_parameter).empty()) {
-                const bool is_first_parameter = (templated_parameter_it == templated_function_decl->param_end());
-                const bool is_last_parameter = (std::next(templated_parameter_it) == templated_function_decl->param_end());
-
-                // Remove the parameter (including any preceding or following commas)
-                clang::SourceLocation start_loc = is_first_parameter ? templated_function_decl->parameters().front()->getLocStart() : templated_parameter->getLocStart();
-                if (is_last_parameter) {
-                    // Delete up to the end of the function signature
-                    clang::SourceLocation end_loc = templated_function_decl->parameters().back()->getLocEnd();
-                    rewriter->ReplaceTextIncludingEndToken({start_loc, end_loc}, "");
-                } else {
-                    // Delete up to the beginning of the next parameter
-                    auto end_loc = (*std::next(templated_parameter_it))->getLocStart();
-                    rewriter->ReplaceTextExcludingEndToken({start_loc, end_loc}, "");
-                }
-            }
-        }
-    }
-
-    // From here on below, assume we have a self-contained definition that we can freely rewrite code in
-    this->current_function = current_function;
-
-    // Patch up body (parameter pack expansions, fold expressions)
-    if (decl->getPrimaryTemplate()) {
-        auto current_function_template_it = function_templates.find(decl->getPrimaryTemplate()->getTemplatedDecl());
-        if (current_function_template_it != function_templates.end()) {
-            auto current_function_template = &current_function_template_it->second;
-            assert(current_function_template);
-
-            for (auto [pack_expansion_expr, pack_uses] : current_function_template->param_pack_expansions) {
-                auto rewriter = static_cast<HierarchicalRewriter*>(this->rewriter.get());
-                auto* pattern = pack_expansion_expr->getPattern();
-                auto range_end = clang::Lexer::getLocForEndOfToken(pack_expansion_expr->getEllipsisLoc(), 0, rewriter->getSourceMgr(), {});
-                auto base_instance = rewriter->MakeInstanceHandle({pattern->getLocStart(), range_end});
-
-                size_t pack_length = DetermineParameterPackSizeVisitor { decl, pack_expansion_expr };
-
-                std::vector<HierarchicalRewriter::InstanceHandle> instances;
-                for (size_t instance_id = 0; instance_id < pack_length; ++instance_id) {
-                    instances.push_back(rewriter->CreateNewInstance(base_instance));
-                }
-
-                // Delete the original pack expansion first, then re-add one copy for each parameter pack element
-                rewriter->ReplaceTextExcludingEndToken(base_instance, {pattern->getLocStart(), range_end}, "/*" + GetClosedStringFor(pattern->getLocStart(), range_end) + " of size " + std::to_string(pack_length) + "*/");
-
-                for (size_t instance_id = 0; instance_id < pack_length; ++instance_id) {
-                    // Insert separators for all but the last instance
-                    const char* replacement = ", ";
-                    if (instance_id == pack_length - 1) {
-                        // No separator needed, so just remove the ellipsis
-                        replacement = "";
+                            pack_it->print(policy, ss);
+                        }
+                    } else {
+                        it->print(policy, ss);
                     }
-                    rewriter->ReplaceTextExcludingEndToken(instances[instance_id], {pack_expansion_expr->getEllipsisLoc(), range_end}, replacement);
+                }
+                ss << '>';
+                ss.flush();
+                // TODO: Templated_decl locs!
+                rewriter->InsertTextAfter(specialized_decl->getLocation(), addendum);
+            }
 
-                    // We generate unique names for function parameters
-                    // expanded from parameter packs. Those now need to be
-                    // patched into the function body whenever the parameter
-                    // pack is referenced.
-                    for (auto* pack_expr : pack_uses) {
-                        clang::SourceRange range = { pack_expr->getLocStart(), clang::Lexer::getLocForEndOfToken(pack_expr->getLocEnd(), 0, rewriter->getSourceMgr(), {}) };
-                        auto parm_var_decl = clang::dyn_cast<clang::ParmVarDecl>(pack_expr->getDecl());
-                        assert(parm_var_decl && parm_var_decl->isParameterPack());
+            // The template generally contains references to the template parameters (in the body and in the function parameter list).
+            // This is a problem in our generated specializations, which don't define the template parameters (i.e. there is no
+            // "template<typename T>" preceding them) but must use the actual template arguments instead.
+            // We address this as follows:
+            // * In the specialization body, we insert type aliases and constants at the top to manually declare template parameters.
+            //   This is much easier than trying to manually replace all occurrences of template parameters with concrete arguments.
+            // * The parameter list is replaced by the FunctionDecl parameter list provided by clang. Stringifying this correctly
+            //   is reasonably easy and gets rid of all template parameter references automatically.
+            //
+            // NOTE: We only need to replace anything for non-empty parameter lists, but note that a specialization's parameter list
+            //       may well be empty while the actual template function's parameter list is not. In particular, this happens for
+            //       template functions of the form
+            //
+            //           template<typename... T> void func(T... t)
+            //
+            //       when specialized for empty parameter packs.
 
-                        const auto& unique_name = current_function.FindSpecializedParamDecls(parm_var_decl)[instance_id].unique_name;
-                        rewriter->ReplaceTextExcludingEndToken(instances[instance_id], range, unique_name);
+            std::transform(templated_decl->param_begin(), templated_decl->param_end(), std::back_inserter(current_function.parameters),
+                        [&](clang::ParmVarDecl* templated_param_decl) {
+                                // TODO: Unify this with FindTemplatedDecl!
+                                auto is_same_decl = [&](const clang::ParmVarDecl* specialized_param_decl) {
+                                                    // Unfortunately, there doesn't seem to be a better way to do this than to compare the parameters by name...
+                                                    return (specialized_param_decl->getName() == templated_param_decl->getName());
+                                                };
+                                auto first_it = std::find_if (specialized_decl->param_begin(), specialized_decl->param_end(), is_same_decl);
+                                auto last_it = std::find_if_not(first_it, specialized_decl->param_end(), is_same_decl);
+
+                                CurrentFunctionInfo::Parameter ret { templated_param_decl, {} };
+
+                                if (first_it + 1 == last_it) {
+                                    // Just one argument
+                                    ret.specialized.push_back({*first_it, templated_param_decl->getNameAsString()});
+                                } else {
+                                    // Templated parameter refers to a parameter pack for which multiple (or none) arguments were generated;
+                                    // to prevent name collisions, generate a unique name for each of them.
+                                    for (auto it = first_it; it != last_it; ++it) {
+                                        std::string unique_name = MakeUniqueParameterPackName(templated_param_decl, std::distance(first_it, it));
+                                        ret.specialized.push_back({*it, std::move(unique_name)});
+                                    }
+                                }
+
+                                return ret;
+                        });
+
+
+            // Remove empty parameter packs from the specialized signature
+            // (Non-empty parameter packs are handled in VisitVarDecl)
+            for (auto templated_parameter_it = templated_decl->param_begin();
+                    templated_parameter_it != templated_decl->param_end();
+                    ++templated_parameter_it) {
+                auto* templated_parameter = *templated_parameter_it;
+                if (templated_parameter->isParameterPack() && current_function.FindSpecializedParamDecls(templated_parameter).empty()) {
+                    const bool is_first_parameter = (templated_parameter_it == templated_decl->param_end());
+                    const bool is_last_parameter = (std::next(templated_parameter_it) == templated_decl->param_end());
+
+                    // Remove the parameter (including any preceding or following commas)
+                    clang::SourceLocation start_loc = is_first_parameter ? templated_decl->parameters().front()->getLocStart() : templated_parameter->getLocStart();
+                    if (is_last_parameter) {
+                        // Delete up to the end of the function signature
+                        clang::SourceLocation end_loc = templated_decl->parameters().back()->getLocEnd();
+                        rewriter->ReplaceTextIncludingEndToken({start_loc, end_loc}, "");
+                    } else {
+                        // Delete up to the beginning of the next parameter
+                        auto end_loc = (*std::next(templated_parameter_it))->getLocStart();
+                        rewriter->ReplaceTextExcludingEndToken({start_loc, end_loc}, "");
                     }
-
-                    // TODO: Also patch "T..." uses in the function body
                 }
             }
         }
-    }
 
-    Parent::TraverseFunctionDecl(decl);
+        // From here on below, assume we have a self-contained definition that we can freely rewrite code in
+        this->current_function = current_function;
 
-    this->current_function = std::nullopt;
+        // Patch up body (parameter pack expansions, fold expressions)
+        /*if (decl2->getPrimaryTemplate())*/ {
+            auto current_function_template_it = function_templates.find(templated_decl);
+            if (current_function_template_it != function_templates.end()) {
+                auto current_function_template = &current_function_template_it->second;
+                assert(current_function_template);
 
-    if (specialize) {
-        // Fix up references to template parameters in the specialization by adding an explicit
-        // declaration of them at the top of the specialization body
-        assert(decl->getPrimaryTemplate());
-        auto template_parameters = decl->getPrimaryTemplate()->getTemplateParameters();
-        auto specialization_args = decl->getTemplateSpecializationArgs()->asArray();
-        assert(template_parameters);
-        assert(template_parameters->size() == specialization_args.size());
-        std::string aliases = "\n";
-        auto parameter_it = template_parameters->begin();
-        auto argument_it = specialization_args.begin();
-        for (;parameter_it != template_parameters->end(); ++parameter_it, ++argument_it) {
-            auto& parameter = *parameter_it;
-            auto& argument = *argument_it;
-            assert(parameter);
+                for (auto [pack_expansion_expr, pack_uses] : current_function_template->param_pack_expansions) {
+                    auto rewriter = static_cast<HierarchicalRewriter*>(this->rewriter.get());
+                    auto* pattern = pack_expansion_expr->getPattern();
+                    auto range_end = clang::Lexer::getLocForEndOfToken(pack_expansion_expr->getEllipsisLoc(), 0, rewriter->getSourceMgr(), {});
+                    auto base_instance = rewriter->MakeInstanceHandle({pattern->getLocStart(), range_end});
 
-            if (parameter->getNameAsString().empty()) {
-                // If the parameter was never named, we don't need to reexport it
-                continue;
-            }
+                    size_t pack_length = DetermineParameterPackSizeVisitor { specialized_decl, pack_expansion_expr };
 
-            switch (argument.getKind()) {
-            case clang::TemplateArgument::Type:
-                // e.g. template<typename Type>
-                aliases += "using " + parameter->getNameAsString() + " = " + argument.getAsType().getAsString() + ";\n";
-                break;
+                    std::vector<HierarchicalRewriter::InstanceHandle> instances;
+                    for (size_t instance_id = 0; instance_id < pack_length; ++instance_id) {
+                        instances.push_back(rewriter->CreateNewInstance(base_instance));
+                    }
 
-            case clang::TemplateArgument::Integral:
-                // e.g. template<int Val>
-                // TODO: Get the actual (possibly const-qualified) type!
-                aliases += "auto " + parameter->getNameAsString() + " = " + argument.getAsIntegral().toString(10) + ";\n";
-                break;
+                    // Delete the original pack expansion first, then re-add one copy for each parameter pack element
+                    rewriter->ReplaceTextExcludingEndToken(base_instance, {pattern->getLocStart(), range_end}, "/*" + GetClosedStringFor(pattern->getLocStart(), range_end) + " of size " + std::to_string(pack_length) + "*/");
 
-            case clang::TemplateArgument::Declaration:
-                // e.g. template<void* Ptr> with Ptr=&some_global_variable
-                std::cerr << "WARNING: TemplateArgument::Declaration not unsupported, yet" << std::endl;
-                aliases += "TODO " + parameter->getNameAsString() + " = TODO;\n";
-                break;
+                    for (size_t instance_id = 0; instance_id < pack_length; ++instance_id) {
+                        // Insert separators for all but the last instance
+                        const char* replacement = ", ";
+                        if (instance_id == pack_length - 1) {
+                            // No separator needed, so just remove the ellipsis
+                            replacement = "";
+                        }
+                        rewriter->ReplaceTextExcludingEndToken(instances[instance_id], {pack_expansion_expr->getEllipsisLoc(), range_end}, replacement);
 
-            case clang::TemplateArgument::NullPtr:
-                // e.g. template<void* Ptr> with Ptr=nullptr
-                aliases += "decltype(nullptr) " + parameter->getNameAsString() + " = nullptr;\n";
-                break;
+                        // We generate unique names for function parameters
+                        // expanded from parameter packs. Those now need to be
+                        // patched into the function body whenever the parameter
+                        // pack is referenced.
+                        for (auto* pack_expr : pack_uses) {
+                            clang::SourceRange range = { pack_expr->getLocStart(), clang::Lexer::getLocForEndOfToken(pack_expr->getLocEnd(), 0, rewriter->getSourceMgr(), {}) };
+                            auto parm_var_decl = clang::dyn_cast<clang::ParmVarDecl>(pack_expr->getDecl());
+                            assert(parm_var_decl && parm_var_decl->isParameterPack());
 
-            case clang::TemplateArgument::Template:
-                // e.g. template<template<typename> Templ>
-                // TODO: How should we handle these? Function bodies can't include templates!
-                // TODO: Instead of ignoring this error, abort specializing this template
-                std::cerr << "WARNING: Template template parameters unsupported" << std::endl;
-                aliases += "TODO template<typename> " + parameter->getNameAsString() + " = TODO;\n";
-                break;
+                            const auto& unique_name = current_function.FindSpecializedParamDecls(parm_var_decl)[instance_id].unique_name;
+                            rewriter->ReplaceTextExcludingEndToken(instances[instance_id], range, unique_name);
+                        }
 
-            case clang::TemplateArgument::Pack:
-                // e.g. template<typename... Types>
-                // e.g. template<int... Vals>
-                // e.g. template<template<typename>... Templs>
-
-                // We don't need to do anything here, since we expand all parameter packs in the function body
-                std::cerr << "WARNING: Variadic templates support is incomplete" << std::endl;
-                break;
-
-            default:
-                std::cerr << "WARNING: Unsupported template argument type: " << static_cast<int>(argument.getKind()) << std::endl;
-                aliases += "TODO " + parameter->getNameAsString() + " = TODO;\n";
-                assert(false);
-                break;
+                        // TODO: Also patch "T..." uses in the function body
+                    }
+                }
             }
         }
-        rewriter->InsertTextAfter(decl->getBody()->getLocStart(), aliases);
-        std::swap(rewriter, old_rewriter);
-        std::string content = static_cast<HierarchicalRewriter*>(old_rewriter.get())->GetContents();
-        rewriter->InsertTextAfter(decl->getLocEnd(), "\n\n// Specialization generated by CFTF\ntemplate<>\n" + content);
+
+        Parent::TraverseFunctionDecl(specialized_decl);
+
+        this->current_function = std::nullopt;
+
+        if (specialize) {
+            // Fix up references to template parameters in the specialization by adding an explicit
+            // declaration of them at the top of the specialization body
+            auto template_parameters = decl->getTemplateParameters();
+            auto specialization_args = specialized_decl->getTemplateSpecializationArgs()->asArray();
+            assert(template_parameters);
+            assert(template_parameters->size() == specialization_args.size());
+            std::string aliases = "\n";
+            auto parameter_it = template_parameters->begin();
+            auto argument_it = specialization_args.begin();
+            for (; parameter_it != template_parameters->end(); ++parameter_it, ++argument_it) {
+                auto& parameter = *parameter_it;
+                auto& argument = *argument_it;
+                assert(parameter);
+
+                if (parameter->getNameAsString().empty()) {
+                    // If the parameter was never named, we don't need to reexport it
+                    continue;
+                }
+
+                switch (argument.getKind()) {
+                case clang::TemplateArgument::Type:
+                    // e.g. template<typename Type>
+                    aliases += "using " + parameter->getNameAsString() + " = " + argument.getAsType().getAsString() + ";\n";
+                    break;
+
+                case clang::TemplateArgument::Integral:
+                    // e.g. template<int Val>
+                    // TODO: Get the actual (possibly const-qualified) type!
+                    aliases += "auto " + parameter->getNameAsString() + " = " + argument.getAsIntegral().toString(10) + ";\n";
+                    break;
+
+                case clang::TemplateArgument::Declaration:
+                    // e.g. template<void* Ptr> with Ptr=&some_global_variable
+                    std::cerr << "WARNING: TemplateArgument::Declaration not unsupported, yet" << std::endl;
+                    aliases += "TODO " + parameter->getNameAsString() + " = TODO;\n";
+                    break;
+
+                case clang::TemplateArgument::NullPtr:
+                    // e.g. template<void* Ptr> with Ptr=nullptr
+                    aliases += "decltype(nullptr) " + parameter->getNameAsString() + " = nullptr;\n";
+                    break;
+
+                case clang::TemplateArgument::Template:
+                    // e.g. template<template<typename> Templ>
+                    // TODO: How should we handle these? Function bodies can't include templates!
+                    // TODO: Instead of ignoring this error, abort specializing this template
+                    std::cerr << "WARNING: Template template parameters unsupported" << std::endl;
+                    aliases += "TODO template<typename> " + parameter->getNameAsString() + " = TODO;\n";
+                    break;
+
+                case clang::TemplateArgument::Pack:
+                    // e.g. template<typename... Types>
+                    // e.g. template<int... Vals>
+                    // e.g. template<template<typename>... Templs>
+
+                    // We don't need to do anything here, since we expand all parameter packs in the function body
+                    std::cerr << "WARNING: Variadic templates support is incomplete" << std::endl;
+                    break;
+
+                default:
+                    std::cerr << "WARNING: Unsupported template argument type: " << static_cast<int>(argument.getKind()) << std::endl;
+                    aliases += "TODO " + parameter->getNameAsString() + " = TODO;\n";
+                    assert(false);
+                    break;
+                }
+            }
+            // TODO: Templated_decl locations
+            rewriter->InsertTextAfter(specialized_decl->getBody()->getLocStart(), aliases);
+            std::swap(rewriter, old_rewriter);
+            std::string content = static_cast<HierarchicalRewriter*>(old_rewriter.get())->GetContents();
+            rewriter->InsertTextAfter(specialized_decl->getLocEnd(), "\n\n// Specialization generated by CFTF\ntemplate<>\n" + content);
+        }
     }
 
-    // TODO: When we're done with the last specialization of this function, remove the original template function definition!
+    // TODO: Now that we're done with the last specialization of this function, remove the original template function definition!
+    // TODO: Adapt "auto" return type in function template declaration if necessary!
 
     return true;
 }

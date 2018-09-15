@@ -40,7 +40,7 @@ public:
     // TODO: Shouldn't be necessary
     bool VisitFunctionDecl(clang::FunctionDecl* decl);
 
-    bool TraverseFunctionDecl(clang::FunctionDecl* decl);
+    bool TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl* decl);
 
     // Used to explicitly specialize function templates which might otherwise be specialized implicitly
     bool VisitFunctionTemplateDecl(clang::FunctionTemplateDecl* decl);
@@ -67,6 +67,9 @@ public:
         // ones.
         std::vector<clang::Decl*> decls;
 
+        // Assumes there is only a single one of these.
+        // Don't use this for ParmVarDecls, since they might be parameter packs
+        // (i.e. multiple specialized Decls per single templated Decl)!
         clang::Decl* FindTemplatedDecl(clang::SourceManager& sm, clang::Decl* specialized) const;
     };
 
