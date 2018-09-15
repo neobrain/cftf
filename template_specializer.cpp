@@ -445,14 +445,6 @@ public:
     size_t count = 0;
 };
 
-bool ASTVisitor::VisitFunctionTemplateDecl(clang::FunctionTemplateDecl*) {
-    return true;
-}
-
-bool ASTVisitor::VisitFunctionDecl(clang::FunctionDecl*) {
-    return true;
-}
-
 clang::ParmVarDecl* ASTVisitor::CurrentFunctionInfo::FindTemplatedParamDecl(clang::ParmVarDecl* specialized) const {
     auto it = std::find_if(parameters.begin(), parameters.end(),
                            [specialized](const Parameter& param) {

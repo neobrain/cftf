@@ -37,13 +37,8 @@ public:
 
     bool TraverseCXXFoldExpr(clang::CXXFoldExpr* expr);
 
-    // TODO: Shouldn't be necessary
-    bool VisitFunctionDecl(clang::FunctionDecl* decl);
-
+    // Used to explicitly specialize function templates which are otherwise specialized implicitly
     bool TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl* decl);
-
-    // Used to explicitly specialize function templates which might otherwise be specialized implicitly
-    bool VisitFunctionTemplateDecl(clang::FunctionTemplateDecl* decl);
 
     bool VisitIfStmt(clang::IfStmt* stmt);
 
