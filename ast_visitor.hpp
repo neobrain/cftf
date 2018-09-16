@@ -44,6 +44,8 @@ public:
 
     bool VisitIfStmt(clang::IfStmt* stmt);
 
+    bool VisitDecompositionDecl(clang::DecompositionDecl* decl);
+
     bool VisitStaticAssertDecl(clang::StaticAssertDecl* decl);
 
     bool shouldTraversePostOrder() const;
