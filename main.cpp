@@ -199,8 +199,6 @@ public:
     FrontendAction() {}
 
     void EndSourceFileAction() override {
-        std::cerr << "Executing action" << std::endl;
-
         clang::SourceManager& sm = rewriter.getSourceMgr();
         // TODO: Handle stdin
         auto filename = sm.getFileEntryForID(sm.getMainFileID())->getName().data();
@@ -213,7 +211,6 @@ public:
     }
 
     std::unique_ptr<clang::ASTConsumer> CreateASTConsumer(clang::CompilerInstance& ci, clang::StringRef file) override {
-        std::cerr << "Creating AST consumer for: " << file.str() << std::endl;
         rewriter.setSourceMgr(ci.getSourceManager(), ci.getLangOpts());
         return llvm::make_unique<ASTConsumer>(rewriter);
     }
@@ -287,7 +284,7 @@ ParsedCommandLine ParseCommandLine(size_t argc, const char* argv[]) {
                 input_indexes.push_back(arg_idx);
                 if (arg[2] == ' ' || std::strcmp(arg, "-isystem") == 0) {
                     if (arg_idx + 1 == argc) {
-                        std::cerr << "Invalid input: Expected symbol after \"-D\", got end of command line" << std::endl;
+                        std::cerr << "Invalid input: Expected symbol after \"-D\" or \"-isystem\", got end of command line" << std::endl;
                         std::exit(1);
                     }
                     // Include the actual definition, too.
@@ -420,7 +417,6 @@ int main(int argc, const char* argv[]){
         // TODO: Use a custom DiagnosticsConsumer to silence the redundant warning output
         int result = tool.run(ct::newFrontendActionFactory<cftf::FrontendAction>().get());
         if (result != 0) {
-            std::cerr << "CFTF FrontendAction failed on file \"" << file << "\" with code " << result << std::endl;
             std::exit(1);
         }
     }
