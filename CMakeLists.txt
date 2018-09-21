@@ -9,3 +9,5 @@ add_executable(cftf constexpr_if.cpp main.cpp rewriter.cpp structured_bindings.c
 target_link_libraries(cftf LLVM clangAST clangBasic clangFrontend clangLex clangTooling clangRewrite stdc++fs)
 set_property(TARGET cftf PROPERTY CXX_STANDARD 17)
 set_property(TARGET cftf PROPERTY CXX_STANDARD_REQUIRED ON)
+
+install(TARGETS cftf RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}/bin")
