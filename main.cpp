@@ -339,6 +339,28 @@ InternalCommandLine BuildInternalCommandLine(const ParsedCommandLine& parsed_cmd
     return internal_command_line;
 }
 
+static std::string GetClangResourceDirectory() {
+    char resource_dir[PATH_MAX];
+    std::FILE* stdout = popen("clang -print-resource-dir", "r");
+    if (!stdout) {
+        std::cerr << "popen failed, falling back to user-specified resource directory for libclang" << std::endl;
+        return "";
+    }
+
+    auto* resource_line = std::fgets(resource_dir, sizeof(resource_dir), stdout);
+    std::fclose(stdout);
+    if (!resource_line) {
+        std::cerr << "Error: Clang couldn't find its own resource-directory?" << std::endl;
+        return "";
+    }
+
+    // Strip new-line: Clang should always print this in normal operation
+    std::string ret = resource_line;
+    assert(ret.back() == '\n');
+    ret.pop_back();
+    return ret;
+}
+
 class CompilationDatabase : public ct::CompilationDatabase {
     std::vector<std::string> infiles;
     std::vector<ct::CompileCommand> commands;
@@ -365,9 +387,8 @@ public:
             // relative to the current working directory. This is used to
             // locate standard library headers though, so we really want to
             // use the resource directory of the actual toolchain instead
-            // TODO: Specify this more generically
             // TODO: Only specify this when not already provided by the user
-            cmd.CommandLine.push_back("-resource-dir=/usr/lib64/clang/6.0.1");
+            cmd.CommandLine.push_back("-resource-dir=" + GetClangResourceDirectory());
 
             if (cmd.Filename == "-") {
                 std::cerr << "stdin not supported, yet" << std::endl;
