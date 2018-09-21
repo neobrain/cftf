@@ -32,6 +32,8 @@ If the clang compiler executable is not installed on the system, you also need t
 
 Projects not using CMake need to resort to hacky solutions, currently. One method is to rename your existing compiler executable and put a copy of the `cftf` executable in its old place. To point CFTF to the frontend compiler, set the CFTF_FRONTEND_CXX, e.g. `export CFTF_FRONTEND_CXX=/usr/bin/g++`.
 
+To make sure CFTF functions correctly, you can try out the `tests/` (using their standalone CMakeLists.txt).
+
 ## Current Status
 
 CFTF is ready enough to be tried out "for fun", but it's still mostly a proof-of-concept. I encourage you to try it out if the idea sounds useful to you, but do note it's not ready for use in production currently. I'm hoping with feedback from the community this will soon change, though!
