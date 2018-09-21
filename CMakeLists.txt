@@ -5,7 +5,7 @@ project(cftf)
 find_package(Clang REQUIRED CONFIG HINTS /usr/lib64/cmake/clang)
 find_package(LLVM REQUIRED CONFIG HINTS /usr/lib64/cmake/llvm)
 
-add_executable(cftf main.cpp)
+add_executable(cftf main.cpp rewriter.cpp)
 target_link_libraries(cftf LLVM clangAST clangBasic clangFrontend clangLex clangTooling clangRewrite)
 set_property(TARGET cftf PROPERTY CXX_STANDARD 17)
 set_property(TARGET cftf PROPERTY CXX_STANDARD_REQUIRED ON)

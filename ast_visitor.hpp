@@ -6,12 +6,13 @@
 
 namespace cftf {
 
+class RewriterBase;
+
 class ASTVisitor : public clang::RecursiveASTVisitor<ASTVisitor> {
     using Parent = clang::RecursiveASTVisitor<ASTVisitor>;
 
 public:
-    ASTVisitor(clang::ASTContext& context, clang::Rewriter& rewriter_)
-        : context(context), rewriter(rewriter_) {}
+    ASTVisitor(clang::ASTContext& context, clang::Rewriter& rewriter_);
 
     bool VisitCXXFoldExpr(clang::CXXFoldExpr* expr);
 
@@ -29,7 +30,7 @@ private:
     std::string GetClosedStringFor(clang::SourceLocation begin, clang::SourceLocation end);
 
     clang::ASTContext& context;
-    clang::Rewriter& rewriter;
+    std::unique_ptr<RewriterBase> rewriter;
 };
 
 } // namespace cftf

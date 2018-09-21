@@ -1,4 +1,6 @@
 #include "ast_visitor.hpp"
+#include "rewriter.hpp"
+
 #include <clang/Lex/Lexer.h>
 #include <clang/Tooling/CommonOptionsParser.h>
 #include <clang/Frontend/FrontendAction.h>
@@ -28,13 +30,17 @@ namespace cftf {
 
 static llvm::cl::OptionCategory tool_category("tool options");
 
+ASTVisitor::ASTVisitor(clang::ASTContext& context, clang::Rewriter& rewriter_)
+        : context(context), rewriter(std::unique_ptr<RewriterBase>(new Rewriter(rewriter_))) {
+}
+
 bool ASTVisitor::VisitCXXFoldExpr(clang::CXXFoldExpr* expr) {
     std::cerr << "Visiting CXX fold expression" << std::endl;
     std::cerr << "  " << std::flush;
     auto* pattern = expr->getPattern();
     pattern->dumpColor();
     std::cerr << std::endl;
-    auto& sm = rewriter.getSourceMgr();
+    auto& sm = rewriter->getSourceMgr();
     const auto pattern_base_str = GetClosedStringFor(pattern->getLocStart(), pattern->getLocEnd());
 
     // TODO: Support operators: + - * / % ^ & | << >>, all of these with an = at the end; ==, !=, <, >, <=, >=, &&, ||, ",", .*, ->*
@@ -99,7 +105,7 @@ bool ASTVisitor::VisitCXXFoldExpr(clang::CXXFoldExpr* expr) {
     pattern_str += ")";
 
     std::cerr << "  Pattern: \"" << pattern_str << '"' << std::endl;
-    rewriter.ReplaceText(expr->getLocStart(), sm.getCharacterData(getLocForEndOfToken(expr->getLocEnd())) - sm.getCharacterData(expr->getLocStart()), pattern_str);
+    rewriter->ReplaceTextIncludingEndToken({expr->getLocStart(), expr->getLocEnd()}, pattern_str);
     return true;
 }
 
@@ -118,10 +124,10 @@ bool ASTVisitor::VisitStaticAssertDecl(clang::StaticAssertDecl* decl) {
     if (decl->getMessage() == nullptr) {
         // Add empty assertion message
         auto assert_cond = GetClosedStringFor(decl->getAssertExpr()->getLocStart(), decl->getAssertExpr()->getLocEnd());
-        auto& sm = rewriter.getSourceMgr();
+        auto& sm = rewriter->getSourceMgr();
 
         auto new_assert = std::string("static_assert(") + assert_cond + ", \"\")";
-        rewriter.ReplaceText(decl->getLocStart(), sm.getCharacterData(getLocForEndOfToken(decl->getLocEnd())) - sm.getCharacterData(decl->getLocStart()), new_assert);
+        rewriter->ReplaceTextIncludingEndToken({decl->getLocStart(), decl->getLocEnd()}, new_assert);
     }
 
     return true;
@@ -136,11 +142,11 @@ bool ASTVisitor::shouldTraversePostOrder() const {
 }
 
 clang::SourceLocation ASTVisitor::getLocForEndOfToken(clang::SourceLocation end) {
-    return clang::Lexer::getLocForEndOfToken(end, 0, rewriter.getSourceMgr(), {});
+    return clang::Lexer::getLocForEndOfToken(end, 0, rewriter->getSourceMgr(), {});
 }
 
 std::string ASTVisitor::GetClosedStringFor(clang::SourceLocation begin, clang::SourceLocation end) {
-    auto& sm = rewriter.getSourceMgr();
+    auto& sm = rewriter->getSourceMgr();
     auto begin_data = sm.getCharacterData(begin);
     auto end_data = sm.getCharacterData(getLocForEndOfToken(end));
     return std::string(begin_data, end_data - begin_data);
