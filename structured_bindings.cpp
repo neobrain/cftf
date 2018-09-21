@@ -66,7 +66,10 @@ bool ASTVisitor::VisitDecompositionDecl(clang::DecompositionDecl* decl) {
         }
         temp_name += binding->getNameAsString();
     }
-    auto rewritten_decl = "auto " + temp_name + " = " + GetClosedStringFor(decl->getInit()->getLocStart(), decl->getInit()->getLocEnd()) + ";\n";
+    temp_name = "cftf_binding_group_" + temp_name;
+
+    auto rewritten_decl = "/*" + GetClosedStringFor(decl->getLocStart(), decl->getLocEnd()) + "*/\n";
+    rewritten_decl += "auto " + temp_name + " = " + GetClosedStringFor(decl->getInit()->getLocStart(), decl->getInit()->getLocEnd()) + ";\n";
 
     if (unqualified_type->isArrayType()) {
         // TODO: For auto, create a new array as a copy of the reference one
@@ -92,13 +95,15 @@ bool ASTVisitor::VisitDecompositionDecl(clang::DecompositionDecl* decl) {
             auto index = std::distance(bindings.begin(), binding_it);
             auto* var = binding->getHoldingVar();
 
+            auto type_string = clang::QualType::getAsString(binding->getType().getSplitDesugaredType(), clang::PrintingPolicy{{}});
+
             // TODO: Does a plain "get" properly ADL-match all
             //       cases here? Things to consider:
             //       * std::get
             //       * Free function get(Object)
             //       * Member function get()
             //       * Friend member function get(Object)
-            rewritten_decl += "auto&& " + var->getNameAsString() + " = get<" + std::to_string(index) + ">(" + temp_name + ");\n";
+            rewritten_decl += type_string + " " + var->getNameAsString() + " = get<" + std::to_string(index) + ">(" + temp_name + ");\n";
         }
     } else {
         // Decomposed types are references to the respective data members
@@ -147,7 +152,8 @@ bool ASTVisitor::VisitDecompositionDecl(clang::DecompositionDecl* decl) {
             for (size_t i = 0; i < bindings.size(); ++i) {
                 assert(fields_it != fields.end());
                 assert(fields_it->getFieldIndex() == i);
-                rewritten_decl += "auto&& " + bindings[i]->getNameAsString() + " = " + temp_name + "." + fields_it->getNameAsString() + ";\n";
+                auto type_string = clang::QualType::getAsString(fields_it->getType().getSplitDesugaredType(), clang::PrintingPolicy{{}});
+                rewritten_decl += type_string + " " + bindings[i]->getNameAsString() + " = " + temp_name + "." + fields_it->getNameAsString() + ";\n";
                 ++fields_it;
             }
             assert(fields_it == fields.end());
