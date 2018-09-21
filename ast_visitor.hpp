@@ -18,6 +18,14 @@ public:
 
     bool TraverseCXXFoldExpr(clang::CXXFoldExpr* expr);
 
+    // TODO: Shouldn't be necessary
+    bool VisitFunctionDecl(clang::FunctionDecl* decl);
+
+    bool TraverseFunctionDecl(clang::FunctionDecl* decl);
+
+    // Used to explicitly specialize function templates which might otherwise be specialized implicitly
+    bool VisitFunctionTemplateDecl(clang::FunctionTemplateDecl* decl);
+
     bool VisitStaticAssertDecl(clang::StaticAssertDecl* decl);
 
     bool shouldTraversePostOrder() const;
