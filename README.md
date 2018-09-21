@@ -18,7 +18,7 @@ There are a number of use cases for this:
 
 ## Build and Usage Instructions
 
-Build CFTF using
+To build CFTF, install libclang 6.0 and then use
 
     mkdir build
     cd build
